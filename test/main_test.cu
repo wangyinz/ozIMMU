@@ -6,6 +6,7 @@
 #include <cutf/device.hpp>
 #include <cutf/math.hpp>
 #include <cutf/memory.hpp>
+#include <cutf/cublas.hpp>
 #include <gpu_monitor/gpu_monitor.hpp>
 #include <iostream>
 #include <mateval/cuda/comparison.hpp>
@@ -77,6 +78,214 @@ void gen_exp_rand(T *const ptr, const std::size_t N, const T phi,
       std::min((N + block_size - 1) / block_size, 1024lu);
 
   gen_exp_rand_kernel<<<grid_size, block_size>>>(ptr, N, phi, seed);
+}
+
+template <class ALPHA_T, class BETA_T>
+int cublas_int8_gemm(const mtk::ozimmu::operation_t op_a,
+                    const mtk::ozimmu::operation_t op_b,
+                    const std::size_t m,
+                    const std::size_t n,
+                    const std::size_t k,
+                    const ALPHA_T* alpha,
+                    const int8_t* a_ptr,
+                    const std::size_t lda,
+                    const int8_t* b_ptr,
+                    const std::size_t ldb,
+                    const BETA_T* beta,
+                    int32_t* c_ptr,
+                    const std::size_t ldc) {
+    // Get cuBLAS handle from ozimmu
+    cublasHandle_t cublas_handle;
+    cublasCreate(&cublas_handle);
+
+    // Convert ozimmu operations to cuBLAS operations
+    const auto op_A_r = (op_a == mtk::ozimmu::op_n) ? CUBLAS_OP_N : CUBLAS_OP_T;
+    const auto op_B_r = (op_b == mtk::ozimmu::op_n) ? CUBLAS_OP_N : CUBLAS_OP_T;
+
+    // For int8 GEMM, we need to cast alpha and beta
+    const int32_t alpha_i = static_cast<int32_t>(*alpha);
+    const int32_t beta_i = static_cast<int32_t>(*beta);
+
+    // Calculate leading dimensions
+    const std::size_t lda_r = (op_a == mtk::ozimmu::op_n) ? lda : k;
+    const std::size_t ldb_r = (op_b == mtk::ozimmu::op_n) ? ldb : n;
+
+    // Perform int8 GEMM using cuBLAS
+    cublasStatus_t status = cublasGemmEx(cublas_handle,
+                         op_A_r, op_B_r,
+                         m, n, k,
+                         &alpha_i,
+                         a_ptr, CUDA_R_8I, lda_r,
+                         b_ptr, CUDA_R_8I, ldb_r,
+                         &beta_i,
+                         c_ptr, CUDA_R_32I, ldc,
+                         CUBLAS_COMPUTE_32I,
+                         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    // Cleanup
+    cublasDestroy(cublas_handle);
+
+    return (status == CUBLAS_STATUS_SUCCESS) ? 0 : 1;
+}
+
+// Add a new compute mode for int8 GEMM
+// namespace mtk {
+// namespace ozimmu {
+// enum compute_mode_t_ext : uint8_t {
+//     // ... existing modes ...
+//     int8_gemm = 100, // Using a different number to avoid conflicts
+// };
+
+// // Extend the get_compute_mode_name_str function
+// std::string get_compute_mode_name_str_ext(const compute_mode_t_ext mode) {
+//     if (mode == int8_gemm) {
+//         return "int8_gemm";
+//     }
+//     // Fall back to original function for other modes
+//     return get_compute_mode_name_str(static_cast<compute_mode_t>(mode));
+// }
+// }
+// }
+
+// Helper function to convert int8_t to float and double
+template <class T>
+__global__ void float_to_int8_kernel(int8_t* dst_ptr, const T* src_ptr, 
+                                    const std::size_t N, const T scale) {
+    const auto tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if (tid >= N) {
+        return;
+    }
+    
+    // Scale and clamp to int8_t range
+    float val = src_ptr[tid] * scale;
+    val = fmaxf(-128.0f, fminf(127.0f, val));
+    dst_ptr[tid] = static_cast<int8_t>(val);
+}
+
+template <class T>
+void float_to_int8(int8_t* dst_ptr, const T* src_ptr, const std::size_t N, const T scale = 10.0) {
+    const std::size_t block_size = 256;
+    const std::size_t grid_size = (N + block_size - 1) / block_size;
+    
+    float_to_int8_kernel<T><<<grid_size, block_size>>>(dst_ptr, src_ptr, N, scale);
+}
+
+// Function to evaluate int8 GEMM performance
+template <class T>
+int gemm_eval_int8(const std::size_t m, const std::size_t n, const std::size_t k,
+                  const mtk::ozimmu::operation_t op_A,
+                  const mtk::ozimmu::operation_t op_B,
+                  const std::string input_mode,
+                  const std::uint32_t test_count = 100) {
+    // Allocate memory for int8 input data
+    auto mat_A_float_uptr = cutf::memory::get_device_unique_ptr<T>(m * k);
+    auto mat_B_float_uptr = cutf::memory::get_device_unique_ptr<T>(k * n);
+    auto mat_A_int8_uptr = cutf::memory::get_device_unique_ptr<int8_t>(m * k);
+    auto mat_B_int8_uptr = cutf::memory::get_device_unique_ptr<int8_t>(k * n);
+    auto mat_C_int32_uptr = cutf::memory::get_device_unique_ptr<int32_t>(m * n);
+    // auto mat_C_ref_uptr = cutf::memory::get_device_unique_ptr<T>(m * n);
+    
+    // Generate random data for A and B
+    auto cugen = cutf::curand::get_curand_unique_ptr(CURAND_RNG_PSEUDO_MT19937);
+    CUTF_CHECK_ERROR(curandSetPseudoRandomGeneratorSeed(*cugen.get(), seed));
+    
+    if (input_mode == "normal01") {
+        CUTF_CHECK_ERROR(cutf::curand::generate_normal(
+            *cugen.get(), mat_A_float_uptr.get(), m * k, 0, 1));
+        CUTF_CHECK_ERROR(cutf::curand::generate_normal(
+            *cugen.get(), mat_B_float_uptr.get(), k * n, 0, 1));
+    } else if (input_mode == "urand01") {
+        CUTF_CHECK_ERROR(cutf::curand::generate_uniform(
+            *cugen.get(), mat_A_float_uptr.get(), m * k));
+        CUTF_CHECK_ERROR(cutf::curand::generate_uniform(
+            *cugen.get(), mat_B_float_uptr.get(), k * n));
+        // Scale to [-1, 1] range for better int8 precision
+        adjust_urand(mat_A_float_uptr.get(), static_cast<T>(-1), static_cast<T>(1), m * k);
+        adjust_urand(mat_B_float_uptr.get(), static_cast<T>(-1), static_cast<T>(1), k * n);
+    } else {
+        double phi = 0;
+        try {
+            phi = std::stod(input_mode.substr(9));
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "Error: %s [%s (line:%d)]\n", e.what(), __FILE__, __LINE__);
+            return 1;
+        }
+        gen_exp_rand<T>(mat_A_float_uptr.get(), m * k, phi, 0);
+        gen_exp_rand<T>(mat_B_float_uptr.get(), k * n, phi, 0);
+    }
+    
+    // Convert float data to int8
+    float_to_int8(mat_A_int8_uptr.get(), mat_A_float_uptr.get(), m * k);
+    float_to_int8(mat_B_int8_uptr.get(), mat_B_float_uptr.get(), k * n);
+    
+    // Compute reference result with higher precision
+    // {
+    //     mtk::ozimmu::handle_t ozimmu_handle;
+    //     mtk::ozimmu::create(&ozimmu_handle);
+        
+    //     const T alpha = 1.0, beta = 0.0;
+    //     mtk::ozimmu::gemm(ozimmu_handle, op_A, op_B, m, n, k, 
+    //                       &alpha, mat_A_float_uptr.get(), m, 
+    //                       mat_B_float_uptr.get(), k, 
+    //                       &beta, mat_C_ref_uptr.get(), m,
+    //                       mtk::ozimmu::dgemm, mtk::ozimmu::real);
+        
+    //     mtk::ozimmu::destroy(ozimmu_handle);
+    // }
+    
+    // Benchmark int8 GEMM
+    int error_flag = 0;
+    const int32_t alpha = 1, beta = 0;
+    
+    // Calculate leading dimensions
+    const auto lda = m;
+    const auto ldb = k;
+    const auto ldc = m;
+    
+    // Initial call to verify functionality
+    error_flag = cublas_int8_gemm(op_A, op_B, m, n, k, 
+                                 &alpha, mat_A_int8_uptr.get(), lda,
+                                 mat_B_int8_uptr.get(), ldb, 
+                                 &beta, mat_C_int32_uptr.get(), ldc);
+    
+    if (error_flag) {
+        return 1;
+    }
+    
+    // Benchmark multiple iterations
+    CUTF_CHECK_ERROR(cudaDeviceSynchronize());
+    const auto start_clock = std::chrono::system_clock::now();
+    
+    for (unsigned i = 0; i < test_count; i++) {
+        error_flag |= cublas_int8_gemm(op_A, op_B, m, n, k, 
+                                      &alpha, mat_A_int8_uptr.get(), lda,
+                                      mat_B_int8_uptr.get(), ldb, 
+                                      &beta, mat_C_int32_uptr.get(), ldc);
+    }
+    
+    if (error_flag) {
+        return 1;
+    }
+    
+    CUTF_CHECK_ERROR(cudaDeviceSynchronize());
+    const auto end_clock = std::chrono::system_clock::now();
+    
+    // Calculate performance metrics
+    const auto elapsed_time =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(end_clock - start_clock)
+            .count() * 1e-9 / test_count;
+    
+    const auto throughput = 2 * m * n * k / elapsed_time;
+        
+    std::printf(
+        "%s,%s,%s,%s,%s,%s,%lu,%lu,%lu,%e\n", get_gpu_name_str().c_str(),
+        "Int8", input_mode.c_str(), "int8_gemm",
+        (op_A == mtk::ozimmu::op_n ? "N" : "T"),
+        (op_B == mtk::ozimmu::op_n ? "N" : "T"), m, n, k, throughput * 1e-12);
+    
+    std::fflush(stdout);
+    
+    return 0;
 }
 
 template <class AB_T, class C_T, class MATMUL_FUNC>
@@ -512,18 +721,18 @@ void gemm_eval_power(const mtk::ozimmu::gemm_list_t &gemm_list) {
 }
 
 std::vector<mtk::ozimmu::compute_mode_t> get_supported_compute_mode() {
-  return std::vector<mtk::ozimmu::compute_mode_t>{
-      mtk::ozimmu::sgemm,          mtk::ozimmu::dgemm,
-      mtk::ozimmu::fp64_int8_3,    mtk::ozimmu::fp64_int8_4,
-      mtk::ozimmu::fp64_int8_5,    mtk::ozimmu::fp64_int8_6,
-      mtk::ozimmu::fp64_int8_7,    mtk::ozimmu::fp64_int8_8,
-      mtk::ozimmu::fp64_int8_9,    mtk::ozimmu::fp64_int8_10,
-      mtk::ozimmu::fp64_int8_11,   mtk::ozimmu::fp64_int8_12,
-      mtk::ozimmu::fp64_int8_13,   mtk::ozimmu::fp64_int8_14,
-      mtk::ozimmu::fp64_int8_15,   mtk::ozimmu::fp64_int8_16,
-      mtk::ozimmu::fp64_int8_17,   mtk::ozimmu::fp64_int8_18,
-      mtk::ozimmu::fp64_int8_auto,
-  };
+    return std::vector<mtk::ozimmu::compute_mode_t>{
+        mtk::ozimmu::sgemm,          mtk::ozimmu::dgemm,
+        mtk::ozimmu::fp64_int8_3,    mtk::ozimmu::fp64_int8_4,
+        mtk::ozimmu::fp64_int8_5,    mtk::ozimmu::fp64_int8_6,
+        mtk::ozimmu::fp64_int8_7,    mtk::ozimmu::fp64_int8_8,
+        mtk::ozimmu::fp64_int8_9,    mtk::ozimmu::fp64_int8_10,
+        mtk::ozimmu::fp64_int8_11,   mtk::ozimmu::fp64_int8_12,
+        mtk::ozimmu::fp64_int8_13,   mtk::ozimmu::fp64_int8_14,
+        mtk::ozimmu::fp64_int8_15,   mtk::ozimmu::fp64_int8_16,
+        mtk::ozimmu::fp64_int8_17,   mtk::ozimmu::fp64_int8_18,
+        mtk::ozimmu::fp64_int8_auto,
+    };
 }
 
 std::vector<mtk::ozimmu::compute_mode_t>
@@ -548,23 +757,24 @@ get_compute_mode_list_from_argv(const std::size_t count, char **argv) {
 }
 
 void print_usage(const char *const program_name) {
-  std::string compute_mode_list_str = "";
-  for (const auto &name : get_supported_compute_mode()) {
-    compute_mode_list_str += mtk::ozimmu::get_compute_mode_name_str(name) + " ";
-  }
-
-  std::printf("Usage:\n"
-              "%s matfile [/path/to/A.matrix] [/path/to/B.matrix] [Computing "
-              "mode list]\n"
-              "%s [urand01 | normal01 | exp_rand-X] [zgemm | dgemm] [seq|exp2] "
-              "[start_N] [end_N] [interval_N] [Computing mode list]\n"
-              "%s power [seq|exp2] [start_N] [end_N] [interval_N] [Computing "
-              "mode list]\n"
-              "%s ci_test\n"
-              "Compute modes:\n"
-              " %s\n",
-              program_name, program_name, program_name, program_name,
-              compute_mode_list_str.c_str());
+    std::string compute_mode_list_str = "";
+    for (const auto &name : get_supported_compute_mode()) {
+        compute_mode_list_str += mtk::ozimmu::get_compute_mode_name_str(name) + " ";
+    }
+    compute_mode_list_str += "int8_gemm "; // Add new mode
+    std::printf("Usage:\n"
+                "%s matfile [/path/to/A.matrix] [/path/to/B.matrix] [Computing "
+                "mode list]\n"
+                "%s [urand01 | normal01 | exp_rand-X] [zgemm | dgemm] [seq|exp2] "
+                "[start_N] [end_N] [interval_N] [Computing mode list]\n"
+                "%s int8_gemm [seq|exp2] [start_N] [end_N] [interval_N] [operation_type (NN|NT|TN|TT)]\n"
+                "%s power [seq|exp2] [start_N] [end_N] [interval_N] [Computing "
+                "mode list]\n"
+                "%s ci_test\n"
+                "Compute modes:\n"
+                " %s\n",
+                program_name, program_name, program_name, program_name, program_name,
+                compute_mode_list_str.c_str());
 }
 
 int main(int argc, char **argv) {
@@ -661,7 +871,57 @@ int main(int argc, char **argv) {
     if (fp64in_gemm_list.size() != 0) {
       gemm_eval<double>(fp64in_gemm_list, input_mode);
     }
-  } else if (input_mode == "power") {
+  } else if (input_mode == "int8_gemm") {
+    if (argc <= 6) {
+        print_usage(argv[0]);
+        return 1;
+    }
+    
+    const auto N_mode = std::string(argv[2]);
+    if (N_mode != "seq" && N_mode != "exp2") {
+        std::fprintf(stderr, "Error: unknown N mode \"%s\"\n", N_mode.c_str());
+        return 1;
+    }
+    
+    const auto min_N = std::stoul(argv[3]);
+    const auto max_N = std::stoul(argv[4]);
+    const auto interval_N = std::stoul(argv[5]);
+    const auto operation_type = std::string(argv[6]);
+    
+    // Parse operation type
+    mtk::ozimmu::operation_t op_A = mtk::ozimmu::op_n;
+    mtk::ozimmu::operation_t op_B = mtk::ozimmu::op_n;
+    
+    if (operation_type == "NN") {
+        op_A = mtk::ozimmu::op_n;
+        op_B = mtk::ozimmu::op_n;
+    } else if (operation_type == "NT") {
+        op_A = mtk::ozimmu::op_n;
+        op_B = mtk::ozimmu::op_t;
+    } else if (operation_type == "TN") {
+        op_A = mtk::ozimmu::op_t;
+        op_B = mtk::ozimmu::op_n;
+    } else if (operation_type == "TT") {
+        op_A = mtk::ozimmu::op_t;
+        op_B = mtk::ozimmu::op_t;
+    } else {
+        std::fprintf(stderr, "Error: unknown operation type \"%s\"\n", operation_type.c_str());
+        return 1;
+    }
+    
+    std::printf("gpu,gemm,input,mode,opA,opB,m,n,k,throughput_in_tops\n");
+    std::fflush(stdout);
+    
+    // Run benchmarks for each matrix size
+    for (std::size_t N = min_N; N <= max_N; N += interval_N) {
+        auto real_N = N;
+        if (N_mode == "exp2") {
+            real_N = 1lu << N;
+        }
+        
+        gemm_eval_int8<double>(real_N, real_N, real_N, op_A, op_B, "urand01");
+    }
+} else if (input_mode == "power") {
     if (argc <= 6) {
       print_usage(argv[0]);
       return 1;
