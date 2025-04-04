@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.18)
 project(ozimmu LANGUAGES CXX CUDA)
 
-set(BUILD_TEST OFF)
+set(BUILD_TEST ON)
 set(AUTO_SUBMODULE_UPDATE ON)
 
 find_package(CUDAToolkit 12.1 REQUIRED)
