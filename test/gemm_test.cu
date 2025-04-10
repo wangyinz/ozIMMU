@@ -35,9 +35,12 @@ void testCublasDgemm(int m, int n, int k, bool transposeA, bool transposeB, int 
 
     // Allocate device memory
     double *d_A, *d_B, *d_C;
-    CUDA_CHECK(cudaMalloc(&d_A, lda * (transposeA ? m : k) * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_B, ldb * (transposeB ? k : n) * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_C, ldc * n * sizeof(double)));
+    cudaStream_t malloc_stream;
+    cudaStreamCreate(&malloc_stream);
+    cublasSetStream(handle, malloc_stream);
+    CUDA_CHECK(cudaMallocAsync(&d_A, lda * (transposeA ? m : k) * sizeof(double), malloc_stream));
+    CUDA_CHECK(cudaMallocAsync(&d_B, ldb * (transposeB ? k : n) * sizeof(double), malloc_stream));
+    CUDA_CHECK(cudaMallocAsync(&d_C, ldc * n * sizeof(double), malloc_stream));
 
     // Initialize host matrices
     double *h_A = (double *)malloc(lda * (transposeA ? m : k) * sizeof(double));
@@ -48,9 +51,10 @@ void testCublasDgemm(int m, int n, int k, bool transposeA, bool transposeB, int 
     for (int i = 0; i < ldb * (transposeB ? k : n); i++) {
         h_B[i] = (double)(rand() % 100) / 100.0;
     }
-
-    CUDA_CHECK(cudaMemcpy(d_A, h_A, lda * (transposeA ? m : k) * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_B, h_B, ldb * (transposeB ? k : n) * sizeof(double), cudaMemcpyHostToDevice));
+    
+    CUDA_CHECK(cudaStreamSynchronize(malloc_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_A, h_A, lda * (transposeA ? m : k) * sizeof(double), cudaMemcpyHostToDevice, malloc_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_B, h_B, ldb * (transposeB ? k : n) * sizeof(double), cudaMemcpyHostToDevice, malloc_stream));
 
     // Set transpose operations
     cublasOperation_t opA = transposeA ? CUBLAS_OP_T : CUBLAS_OP_N;
@@ -63,6 +67,7 @@ void testCublasDgemm(int m, int n, int k, bool transposeA, bool transposeB, int 
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaStreamSynchronize(malloc_stream));
     float milliseconds = 0.0;
 
     // Warm-up
@@ -85,9 +90,9 @@ void testCublasDgemm(int m, int n, int k, bool transposeA, bool transposeB, int 
     // Clean up
     free(h_A);
     free(h_B);
-    CUDA_CHECK(cudaFree(d_A));
-    CUDA_CHECK(cudaFree(d_B));
-    CUDA_CHECK(cudaFree(d_C));
+    CUDA_CHECK(cudaFreeAsync(d_A, malloc_stream));
+    CUDA_CHECK(cudaFreeAsync(d_B, malloc_stream));
+    CUDA_CHECK(cudaFreeAsync(d_C, malloc_stream));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
     CUBLAS_CHECK(cublasDestroy(handle));
@@ -105,9 +110,12 @@ void testCublasGemmEx(int m, int n, int k, bool transposeA, bool transposeB, int
     // Allocate device memory
     int8_t *d_A_int8, *d_B_int8;
     int32_t *d_C_int32;
-    CUDA_CHECK(cudaMalloc(&d_A_int8, lda * (transposeA ? m : k) * sizeof(int8_t)));
-    CUDA_CHECK(cudaMalloc(&d_B_int8, ldb * (transposeB ? k : n) * sizeof(int8_t)));
-    CUDA_CHECK(cudaMalloc(&d_C_int32, ldc * n * sizeof(int32_t)));
+    cudaStream_t malloc_stream;
+    cudaStreamCreate(&malloc_stream);
+    cublasSetStream(handle, malloc_stream);
+    CUDA_CHECK(cudaMallocAsync(&d_A_int8, lda * (transposeA ? m : k) * sizeof(int8_t), malloc_stream));
+    CUDA_CHECK(cudaMallocAsync(&d_B_int8, ldb * (transposeB ? k : n) * sizeof(int8_t), malloc_stream));
+    CUDA_CHECK(cudaMallocAsync(&d_C_int32, ldc * n * sizeof(int32_t), malloc_stream));
 
     // Initialize host matrices
     int8_t *h_A_int8 = (int8_t *)malloc(lda * (transposeA ? m : k) * sizeof(int8_t));
@@ -119,8 +127,9 @@ void testCublasGemmEx(int m, int n, int k, bool transposeA, bool transposeB, int
         h_B_int8[i] = (int8_t)(rand() % 100); // Direct int8 values
     }
 
-    CUDA_CHECK(cudaMemcpy(d_A_int8, h_A_int8, lda * (transposeA ? m : k) * sizeof(int8_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_B_int8, h_B_int8, ldb * (transposeB ? k : n) * sizeof(int8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaStreamSynchronize(malloc_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_A_int8, h_A_int8, lda * (transposeA ? m : k) * sizeof(int8_t), cudaMemcpyHostToDevice, malloc_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_B_int8, h_B_int8, ldb * (transposeB ? k : n) * sizeof(int8_t), cudaMemcpyHostToDevice, malloc_stream));
 
     // Set transpose operations
     cublasOperation_t opA = transposeA ? CUBLAS_OP_T : CUBLAS_OP_N;
@@ -133,6 +142,7 @@ void testCublasGemmEx(int m, int n, int k, bool transposeA, bool transposeB, int
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaStreamSynchronize(malloc_stream));
     float milliseconds = 0.0;
 
     // Warm-up
@@ -159,9 +169,9 @@ void testCublasGemmEx(int m, int n, int k, bool transposeA, bool transposeB, int
     // Clean up
     free(h_A_int8);
     free(h_B_int8);
-    CUDA_CHECK(cudaFree(d_A_int8));
-    CUDA_CHECK(cudaFree(d_B_int8));
-    CUDA_CHECK(cudaFree(d_C_int32));
+    CUDA_CHECK(cudaFreeAsync(d_A_int8, malloc_stream));
+    CUDA_CHECK(cudaFreeAsync(d_B_int8, malloc_stream));
+    CUDA_CHECK(cudaFreeAsync(d_C_int32, malloc_stream));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
     CUBLAS_CHECK(cublasDestroy(handle));
@@ -180,24 +190,27 @@ void testCublasLtMatmul(int m, int n, int k, bool transposeA, bool transposeB, i
     //    return;
     //}
 
-    cublasLtHandle_t handle;
-    CUBLAS_CHECK(cublasLtCreate(&handle));
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
 
     int lda = transposeA ? k : m; //k A is transposed (k x m)
     int ldb = transposeB ? n : k; //k B is non-transposed (k x n)
     int ldc = m; //C is m x n
     if (lda % 4 != 0 || ldb % 4 != 0 || ldc % 4 != 0) {
         printf("cublasLtMatmul: Skipping test (leading dimensions must be multiples of 4 for IMMA)\n");
-        CUBLAS_CHECK(cublasLtDestroy(handle));
+        CUBLAS_CHECK(cublasDestroy(handle));
         return;
     }
 
     // Allocate device memory (cudaMalloc typically provides 256-byte alignment)
     int8_t *d_A_int8, *d_B_int8;
     int32_t *d_C_int32;
-    CUDA_CHECK(cudaMalloc((void**)&d_A_int8, lda * (transposeA ? m : k) * sizeof(int8_t)));
-    CUDA_CHECK(cudaMalloc((void**)&d_B_int8, ldb * (transposeB ? k : n) * sizeof(int8_t)));
-    CUDA_CHECK(cudaMalloc((void**)&d_C_int32, ldc * n * sizeof(int32_t)));
+    cudaStream_t malloc_stream;
+    cudaStreamCreate(&malloc_stream);
+    cublasSetStream(handle, malloc_stream);
+    CUDA_CHECK(cudaMallocAsync((void**)&d_A_int8, lda * (transposeA ? m : k) * sizeof(int8_t), malloc_stream));
+    CUDA_CHECK(cudaMallocAsync((void**)&d_B_int8, ldb * (transposeB ? k : n) * sizeof(int8_t), malloc_stream));
+    CUDA_CHECK(cudaMallocAsync((void**)&d_C_int32, ldc * n * sizeof(int32_t), malloc_stream));
 
     // Verify alignment (optional, for debugging)
     if ((uintptr_t)d_A_int8 % 16 != 0 || (uintptr_t)d_B_int8 % 16 != 0 || (uintptr_t)d_C_int32 % 16 != 0) {
@@ -214,8 +227,9 @@ void testCublasLtMatmul(int m, int n, int k, bool transposeA, bool transposeB, i
         h_B_int8[i] = (int8_t)(rand() % 100);
     }
 
-    CUDA_CHECK(cudaMemcpy(d_A_int8, h_A_int8, lda * (transposeA ? m : k) * sizeof(int8_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_B_int8, h_B_int8, ldb * (transposeB ? k : n) * sizeof(int8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaStreamSynchronize(malloc_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_A_int8, h_A_int8, lda * (transposeA ? m : k) * sizeof(int8_t), cudaMemcpyHostToDevice, malloc_stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_B_int8, h_B_int8, ldb * (transposeB ? k : n) * sizeof(int8_t), cudaMemcpyHostToDevice, malloc_stream));
 
     // Set up matrix descriptors (default COL-major order)
     cublasLtMatrixLayout_t Adesc, Bdesc, Cdesc;
@@ -238,7 +252,7 @@ void testCublasLtMatmul(int m, int n, int k, bool transposeA, bool transposeB, i
     // Workspace
     void *workspace;
     size_t workspaceSize = 1024 * 1024 * 1; // 32MB for sm90
-    CUDA_CHECK(cudaMalloc(&workspace, workspaceSize));
+    CUDA_CHECK(cudaMallocAsync(&workspace, workspaceSize, malloc_stream));
 
     // Algorithm selection (optional, using default for simplicity)
     //cublasLtMatmulAlgo_t algo;
@@ -248,16 +262,17 @@ void testCublasLtMatmul(int m, int n, int k, bool transposeA, bool transposeB, i
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaStreamSynchronize(malloc_stream));
     float milliseconds = 0.0;
 
     // Warm-up
-    CUBLAS_CHECK(cublasLtMatmul(handle, matmulDesc, &alpha_int32, d_A_int8, Adesc, d_B_int8, Bdesc,
+    CUBLAS_CHECK(cublasLtMatmul((cublasLtHandle_t)handle, matmulDesc, &alpha_int32, d_A_int8, Adesc, d_B_int8, Bdesc,
                                 &beta_int32, d_C_int32, Cdesc, d_C_int32, Cdesc, NULL, workspace, workspaceSize, 0));
 
     // Timed run
     CUDA_CHECK(cudaEventRecord(start));
     for (int i = 0; i < iterations; i++) {
-        CUBLAS_CHECK(cublasLtMatmul(handle, matmulDesc, &alpha_int32, d_A_int8, Adesc, d_B_int8, Bdesc,
+        CUBLAS_CHECK(cublasLtMatmul((cublasLtHandle_t)handle, matmulDesc, &alpha_int32, d_A_int8, Adesc, d_B_int8, Bdesc,
                                     &beta_int32, d_C_int32, Cdesc, d_C_int32, Cdesc, NULL, workspace, workspaceSize, 0));
     }
     CUDA_CHECK(cudaEventRecord(stop));
@@ -272,17 +287,17 @@ void testCublasLtMatmul(int m, int n, int k, bool transposeA, bool transposeB, i
     // Clean up
     free(h_A_int8);
     free(h_B_int8);
-    CUDA_CHECK(cudaFree(d_A_int8));
-    CUDA_CHECK(cudaFree(d_B_int8));
-    CUDA_CHECK(cudaFree(d_C_int32));
-    CUDA_CHECK(cudaFree(workspace));
+    CUDA_CHECK(cudaFreeAsync(d_A_int8 , malloc_stream));
+    CUDA_CHECK(cudaFreeAsync(d_B_int8 , malloc_stream));
+    CUDA_CHECK(cudaFreeAsync(d_C_int32, malloc_stream));
+    CUDA_CHECK(cudaFreeAsync(workspace, malloc_stream));
     CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Adesc));
     CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Bdesc));
     CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Cdesc));
     CUBLAS_CHECK(cublasLtMatmulDescDestroy(matmulDesc));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
-    CUBLAS_CHECK(cublasLtDestroy(handle));
+    CUBLAS_CHECK(cublasDestroy(handle));
 }
 
 int main(int argc, char *argv[]) {
