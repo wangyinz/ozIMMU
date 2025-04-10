@@ -237,7 +237,7 @@ void testCublasLtMatmul(int m, int n, int k, bool transposeA, bool transposeB, i
 
     // Workspace
     void *workspace;
-    size_t workspaceSize = 1024 * 1024; // 1MB
+    size_t workspaceSize = 1024 * 1024 * 1; // 32MB for sm90
     CUDA_CHECK(cudaMalloc(&workspace, workspaceSize));
 
     // Algorithm selection (optional, using default for simplicity)
