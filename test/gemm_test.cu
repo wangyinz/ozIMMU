@@ -288,6 +288,7 @@ void testCublasLtMatmul(int m, int n, int k, bool transposeA, bool transposeB, i
 int main(int argc, char *argv[]) {
     int m = 4096, n = 4096, k = 4096, iterations = 10;
     bool transposeA = true, transposeB = false, verbose = false;
+    bool runDgemm = true, runGemmEx = true, runLtMatmul = true;
 
     // Define long options
 static struct option long_options[] = {
@@ -302,12 +303,15 @@ static struct option long_options[] = {
         {"mk", required_argument, 0, '2'},
         {"nk", required_argument, 0, '3'},
         {"mnk", required_argument, 0, '4'},
+	{"dgemm", required_argument, 0, 'd'},      
+	{"gemmex", required_argument, 0, 'g'},
+	{"ltmatmul", required_argument, 0, 'l'},
         {0, 0, 0, 0}
     };
 
     int opt;
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "m:n:k:a:b:i:v1:2:3:4:", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:n:k:a:b:i:v1:2:3:4:d:g:l:", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'm':
                 m = atoi(optarg);
@@ -342,9 +346,18 @@ static struct option long_options[] = {
             case '4': // -mnk or --mnk
                 m = n = k = atoi(optarg);
                 break;
+            case 'd': // -dgemm or --dgemm
+                runDgemm = atoi(optarg) != 0;
+                break;
+            case 'g': // -gemmex or --gemmex
+                runGemmEx = atoi(optarg) != 0;
+                break;
+            case 'l': // -ltmatmul or --ltmatmul
+                runLtMatmul = atoi(optarg) != 0;
+                break;
             default:
-                fprintf(stderr, "Usage: %s [--m|-m] <m> [--n|-n] <n> [--k|-k] <k> [--mn] <m=n> [--mk] <m=k> [--nk] <n=k> [--mnk] <m=n=k> [--transposeA|-a] <0/1> [--transposeB|-b] <0/1> [--iterations|-i] <iterations> [--verbose|-v]\n", argv[0]);
-                fprintf(stderr, "Defaults: m=4096, n=4096, k=4096, transposeA=1, transposeB=0, iterations=10\n");
+                fprintf(stderr, "Usage: %s [--m|-m] <m> [--n|-n] <n> [--k|-k] <k> [--mn] <m=n> [--mk] <m=k> [--nk] <n=k> [--mnk] <m=n=k> [--transposeA|-a] <0/1> [--transposeB|-b] <0/1> [--iterations|-i] <iterations> [--verbose|-v] [--dgemm|-d] <0/1> [--gemmex|-g] <0/1> [--ltmatmul|-l] <0/1>\n", argv[0]);
+                fprintf(stderr, "Defaults: m=4096, n=4096, k=4096, transposeA=1, transposeB=0, iterations=10, dgemm=1, gemmex=1, ltmatmul=1\n");                
                 return EXIT_FAILURE;
         }    
     }	
@@ -353,6 +366,8 @@ static struct option long_options[] = {
         printf("Matrix dimensions: m=%d, n=%d, k=%d\n", m, n, k);
         printf("Transpose A: %s, Transpose B: %s\n", transposeA ? "Yes" : "No", transposeB ? "Yes" : "No");
         printf("Iterations: %d\n", iterations);
+        printf("Tests enabled: dgemm=%s, gemmex=%s, ltmatmul=%s\n",
+               runDgemm ? "Yes" : "No", runGemmEx ? "Yes" : "No", runLtMatmul ? "Yes" : "No");
     }
 
     if (m <= 0 || n <= 0 || k <= 0 || iterations <= 0) {
@@ -363,9 +378,15 @@ static struct option long_options[] = {
     printf("+--------------------+------------+----------+\n");
     printf("| Operation          | Time (ms)  | T*OPS    |\n");
     printf("+--------------------+------------+----------+\n");
-    testCublasDgemm(m, n, k, transposeA, transposeB, iterations);
-    testCublasGemmEx(m, n, k, transposeA, transposeB, iterations);
-    testCublasLtMatmul(m, n, k, transposeA, transposeB, iterations);
+    if (runDgemm) {
+        testCublasDgemm(m, n, k, transposeA, transposeB, iterations);
+    }
+    if (runGemmEx) {
+        testCublasGemmEx(m, n, k, transposeA, transposeB, iterations);
+    }
+    if (runLtMatmul) {
+        testCublasLtMatmul(m, n, k, transposeA, transposeB, iterations);
+    }
     printf("+--------------------+------------+----------+\n");
 
     return 0;
