@@ -154,7 +154,7 @@ void testCublasGemmEx(int m, int n, int k, bool transposeA, bool transposeB, int
     // Compute TOPS
     double ops = 2.0 * (double)m * (double)n * (double)k * iterations;
     double tops = (ops / (milliseconds / 1000.0)) / 1e12;
-    printf("| GemmEx (int8)      | %10.3f | %8.3f |\n", milliseconds/iterations, tops);
+    printf("| GemmEx(int8)       | %10.3f | %8.3f |\n", milliseconds/iterations, tops);
 
     // Clean up
     free(h_A_int8);
@@ -169,23 +169,23 @@ void testCublasGemmEx(int m, int n, int k, bool transposeA, bool transposeB, int
 
 void testCublasLtMatmul(int m, int n, int k, bool transposeA, bool transposeB, int iterations) {
     // Enforce TN format for IMMA
-    if (!transposeA || transposeB) {
-        printf("cublasLtMatmul: Skipping test (IMMA requires A transposed, B non-transposed)\n");
-        return;
-    }
+    //if (!transposeA || transposeB) {
+    //    printf("cublasLtMatmul: Skipping test (IMMA requires A transposed, B non-transposed)\n");
+    //    return;
+    //}
 
     // Check IMMA requirements
-    if (m % 4 != 0 || k % 4 != 0) {
-        printf("cublasLtMatmul: Skipping test (m and k must be multiples of 4 for IMMA)\n");
-        return;
-    }
+    //if (m % 4 != 0 || k % 4 != 0) {
+    //    printf("cublasLtMatmul: Skipping test (m and k must be multiples of 4 for IMMA)\n");
+    //    return;
+    //}
 
     cublasLtHandle_t handle;
     CUBLAS_CHECK(cublasLtCreate(&handle));
 
-    int lda = k; // A is transposed (k x m)
-    int ldb = k; // B is non-transposed (k x n)
-    int ldc = m; // C is m x n
+    int lda = transposeA ? k : m; //k A is transposed (k x m)
+    int ldb = transposeB ? n : k; //k B is non-transposed (k x n)
+    int ldc = m; //C is m x n
     if (lda % 4 != 0 || ldb % 4 != 0 || ldc % 4 != 0) {
         printf("cublasLtMatmul: Skipping test (leading dimensions must be multiples of 4 for IMMA)\n");
         CUBLAS_CHECK(cublasLtDestroy(handle));
@@ -195,8 +195,8 @@ void testCublasLtMatmul(int m, int n, int k, bool transposeA, bool transposeB, i
     // Allocate device memory (cudaMalloc typically provides 256-byte alignment)
     int8_t *d_A_int8, *d_B_int8;
     int32_t *d_C_int32;
-    CUDA_CHECK(cudaMalloc((void**)&d_A_int8, lda * m * sizeof(int8_t)));
-    CUDA_CHECK(cudaMalloc((void**)&d_B_int8, ldb * n * sizeof(int8_t)));
+    CUDA_CHECK(cudaMalloc((void**)&d_A_int8, lda * (transposeA ? m : k) * sizeof(int8_t)));
+    CUDA_CHECK(cudaMalloc((void**)&d_B_int8, ldb * (transposeB ? k : n) * sizeof(int8_t)));
     CUDA_CHECK(cudaMalloc((void**)&d_C_int32, ldc * n * sizeof(int32_t)));
 
     // Verify alignment (optional, for debugging)
@@ -205,29 +205,29 @@ void testCublasLtMatmul(int m, int n, int k, bool transposeA, bool transposeB, i
     }
 
     // Initialize host matrices
-    int8_t *h_A_int8 = (int8_t *)malloc(lda * m * sizeof(int8_t));
-    int8_t *h_B_int8 = (int8_t *)malloc(ldb * n * sizeof(int8_t));
-    for (int i = 0; i < lda * m; i++) {
+    int8_t *h_A_int8 = (int8_t *)malloc(lda * (transposeA ? m : k) * sizeof(int8_t));
+    int8_t *h_B_int8 = (int8_t *)malloc(ldb * (transposeB ? k : n) * sizeof(int8_t));
+    for (int i = 0; i < lda * (transposeA ? m : k); i++) {
         h_A_int8[i] = (int8_t)(rand() % 100);
     }
-    for (int i = 0; i < ldb * n; i++) {
+    for (int i = 0; i < ldb * (transposeB ? k : n); i++) {
         h_B_int8[i] = (int8_t)(rand() % 100);
     }
 
-    CUDA_CHECK(cudaMemcpy(d_A_int8, h_A_int8, lda * m * sizeof(int8_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_B_int8, h_B_int8, ldb * n * sizeof(int8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_A_int8, h_A_int8, lda * (transposeA ? m : k) * sizeof(int8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B_int8, h_B_int8, ldb * (transposeB ? k : n) * sizeof(int8_t), cudaMemcpyHostToDevice));
 
     // Set up matrix descriptors (default COL-major order)
     cublasLtMatrixLayout_t Adesc, Bdesc, Cdesc;
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_8I, k, m, lda)); // A: k x m (transposed)
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_8I, k, n, ldb)); // B: k x n (non-transposed)
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_8I, lda, (transposeA ? m : k), lda)); // A: k x m (transposed)
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_8I, ldb, (transposeB ? k : n), ldb)); // B: k x n (non-transposed)
     CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_32I, m, n, ldc)); // C: m x n
 
     // Set up matmul descriptor
     cublasLtMatmulDesc_t matmulDesc;
     CUBLAS_CHECK(cublasLtMatmulDescCreate(&matmulDesc, CUBLAS_COMPUTE_32I, CUDA_R_32I));
-    cublasOperation_t opA = CUBLAS_OP_T;
-    cublasOperation_t opB = CUBLAS_OP_N;
+    cublasOperation_t opA = transposeA ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t opB = transposeB ? CUBLAS_OP_T : CUBLAS_OP_N;
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
 
