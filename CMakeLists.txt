@@ -89,7 +89,7 @@ if (${BUILD_TEST})
   add_subdirectory(test/mateval)
   add_subdirectory(test/gpu_monitor)
 
-  foreach(test main)
+  foreach(test main gemm)
     set(test_out ${test}.test)
     add_executable(${test_out} ${TESTSRCDIR}/${test}_test.cu ${HEADERS})
     target_include_directories(${test_out} PRIVATE ${INCDIR})
