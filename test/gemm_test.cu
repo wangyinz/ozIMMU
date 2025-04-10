@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cublasLt.h> 
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -79,7 +80,7 @@ void testCublasDgemm(int m, int n, int k, bool transposeA, bool transposeB, int 
     // Compute TFLOPS
     double flops = 2.0 * (double)m * (double)n * (double)k * iterations;
     double tflops = (flops / (milliseconds / 1000.0)) / 1e12;
-    printf("| cublasDgemm        | %10.3f | %7.3f |\n", milliseconds, tflops);
+    printf("| Dgemm              | %10.3f | %8.3f |\n", milliseconds/iterations, tflops);
 
     // Clean up
     free(h_A);
@@ -153,7 +154,7 @@ void testCublasGemmEx(int m, int n, int k, bool transposeA, bool transposeB, int
     // Compute TOPS
     double ops = 2.0 * (double)m * (double)n * (double)k * iterations;
     double tops = (ops / (milliseconds / 1000.0)) / 1e12;
-    printf("| cublasGemmEx (int8)| %10.3f | %7.3f |\n", milliseconds, tops);
+    printf("| GemmEx (int8)      | %10.3f | %8.3f |\n", milliseconds/iterations, tops);
 
     // Clean up
     free(h_A_int8);
@@ -164,6 +165,124 @@ void testCublasGemmEx(int m, int n, int k, bool transposeA, bool transposeB, int
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
     CUBLAS_CHECK(cublasDestroy(handle));
+}
+
+void testCublasLtMatmul(int m, int n, int k, bool transposeA, bool transposeB, int iterations) {
+    // Enforce TN format for IMMA
+    if (!transposeA || transposeB) {
+        printf("cublasLtMatmul: Skipping test (IMMA requires A transposed, B non-transposed)\n");
+        return;
+    }
+
+    // Check IMMA requirements
+    if (m % 4 != 0 || k % 4 != 0) {
+        printf("cublasLtMatmul: Skipping test (m and k must be multiples of 4 for IMMA)\n");
+        return;
+    }
+
+    cublasLtHandle_t handle;
+    CUBLAS_CHECK(cublasLtCreate(&handle));
+
+    int lda = k; // A is transposed (k x m)
+    int ldb = k; // B is non-transposed (k x n)
+    int ldc = m; // C is m x n
+    if (lda % 4 != 0 || ldb % 4 != 0 || ldc % 4 != 0) {
+        printf("cublasLtMatmul: Skipping test (leading dimensions must be multiples of 4 for IMMA)\n");
+        CUBLAS_CHECK(cublasLtDestroy(handle));
+        return;
+    }
+
+    // Allocate device memory (cudaMalloc typically provides 256-byte alignment)
+    int8_t *d_A_int8, *d_B_int8;
+    int32_t *d_C_int32;
+    CUDA_CHECK(cudaMalloc((void**)&d_A_int8, lda * m * sizeof(int8_t)));
+    CUDA_CHECK(cudaMalloc((void**)&d_B_int8, ldb * n * sizeof(int8_t)));
+    CUDA_CHECK(cudaMalloc((void**)&d_C_int32, ldc * n * sizeof(int32_t)));
+
+    // Verify alignment (optional, for debugging)
+    if ((uintptr_t)d_A_int8 % 16 != 0 || (uintptr_t)d_B_int8 % 16 != 0 || (uintptr_t)d_C_int32 % 16 != 0) {
+        printf("cublasLtMatmul: Warning: Memory not 16-byte aligned\n");
+    }
+
+    // Initialize host matrices
+    int8_t *h_A_int8 = (int8_t *)malloc(lda * m * sizeof(int8_t));
+    int8_t *h_B_int8 = (int8_t *)malloc(ldb * n * sizeof(int8_t));
+    for (int i = 0; i < lda * m; i++) {
+        h_A_int8[i] = (int8_t)(rand() % 100);
+    }
+    for (int i = 0; i < ldb * n; i++) {
+        h_B_int8[i] = (int8_t)(rand() % 100);
+    }
+
+    CUDA_CHECK(cudaMemcpy(d_A_int8, h_A_int8, lda * m * sizeof(int8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B_int8, h_B_int8, ldb * n * sizeof(int8_t), cudaMemcpyHostToDevice));
+
+    // Set up matrix descriptors (default COL-major order)
+    cublasLtMatrixLayout_t Adesc, Bdesc, Cdesc;
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_8I, k, m, lda)); // A: k x m (transposed)
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_8I, k, n, ldb)); // B: k x n (non-transposed)
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_32I, m, n, ldc)); // C: m x n
+
+    // Set up matmul descriptor
+    cublasLtMatmulDesc_t matmulDesc;
+    CUBLAS_CHECK(cublasLtMatmulDescCreate(&matmulDesc, CUBLAS_COMPUTE_32I, CUDA_R_32I));
+    cublasOperation_t opA = CUBLAS_OP_T;
+    cublasOperation_t opB = CUBLAS_OP_N;
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
+
+    // Scalars
+    int32_t alpha_int32 = 1;
+    int32_t beta_int32 = 0;
+
+    // Workspace
+    void *workspace;
+    size_t workspaceSize = 1024 * 1024; // 1MB
+    CUDA_CHECK(cudaMalloc(&workspace, workspaceSize));
+
+    // Algorithm selection (optional, using default for simplicity)
+    //cublasLtMatmulAlgo_t algo;
+    // For better performance, you could use cublasLtMatmulAlgoGetHeuristic here
+
+    // Timing setup
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    float milliseconds = 0.0;
+
+    // Warm-up
+    CUBLAS_CHECK(cublasLtMatmul(handle, matmulDesc, &alpha_int32, d_A_int8, Adesc, d_B_int8, Bdesc,
+                                &beta_int32, d_C_int32, Cdesc, d_C_int32, Cdesc, NULL, workspace, workspaceSize, 0));
+
+    // Timed run
+    CUDA_CHECK(cudaEventRecord(start));
+    for (int i = 0; i < iterations; i++) {
+        CUBLAS_CHECK(cublasLtMatmul(handle, matmulDesc, &alpha_int32, d_A_int8, Adesc, d_B_int8, Bdesc,
+                                    &beta_int32, d_C_int32, Cdesc, d_C_int32, Cdesc, NULL, workspace, workspaceSize, 0));
+    }
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+
+    // Compute TOPS
+    double ops = 2.0 * (double)m * (double)n * (double)k * iterations;
+    double tops = (ops / (milliseconds / 1000.0)) / 1e12;
+    printf("| LtMatmul(int8)     | %10.3f | %8.3f |\n", milliseconds/iterations, tops);
+
+    // Clean up
+    free(h_A_int8);
+    free(h_B_int8);
+    CUDA_CHECK(cudaFree(d_A_int8));
+    CUDA_CHECK(cudaFree(d_B_int8));
+    CUDA_CHECK(cudaFree(d_C_int32));
+    CUDA_CHECK(cudaFree(workspace));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Adesc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Bdesc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Cdesc));
+    CUBLAS_CHECK(cublasLtMatmulDescDestroy(matmulDesc));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUBLAS_CHECK(cublasLtDestroy(handle));
 }
 
 int main(int argc, char *argv[]) {
@@ -241,12 +360,13 @@ static struct option long_options[] = {
         return EXIT_FAILURE;
     }
 
-    printf("+--------------------+------------+---------+\n");
-    printf("| Operation          | Time (ms)  | T*OPS  |\n");
-    printf("+--------------------+------------+---------+\n");
+    printf("+--------------------+------------+----------+\n");
+    printf("| Operation          | Time (ms)  | T*OPS    |\n");
+    printf("+--------------------+------------+----------+\n");
     testCublasDgemm(m, n, k, transposeA, transposeB, iterations);
     testCublasGemmEx(m, n, k, transposeA, transposeB, iterations);
-    printf("+--------------------+------------+---------+\n");
+    testCublasLtMatmul(m, n, k, transposeA, transposeB, iterations);
+    printf("+--------------------+------------+----------+\n");
 
     return 0;
 }
