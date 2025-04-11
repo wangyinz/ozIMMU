@@ -89,7 +89,7 @@ if (${BUILD_TEST})
   add_subdirectory(test/mateval)
   add_subdirectory(test/gpu_monitor)
 
-  foreach(test main gemm)
+  foreach(test main)
     set(test_out ${test}.test)
     add_executable(${test_out} ${TESTSRCDIR}/${test}_test.cu ${HEADERS})
     target_include_directories(${test_out} PRIVATE ${INCDIR})
@@ -103,4 +103,9 @@ if (${BUILD_TEST})
       gpu_monitor
     )
   endforeach()
+  set(test_out gemm.test)
+  add_executable(${test_out} ${TESTSRCDIR}/gemm_test.cu ${HEADERS})
+  target_link_libraries(${test_out} PRIVATE
+    CUDA::cublas
+  )
 endif()
