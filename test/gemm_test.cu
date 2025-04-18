@@ -29,7 +29,7 @@
 void testCublasDgemm(int m, int n, int k, bool transposeA, bool transposeB, int iterations) {
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
-
+    //CUBLAS_CHECK(cublasSetMathMode(handle, cublasMath_t(CUBLAS_PEDANTIC_MATH | CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)));
     int lda = transposeA ? k : m;
     int ldb = transposeB ? n : k;
     int ldc = m;
