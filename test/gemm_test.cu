@@ -7,6 +7,7 @@
 #include <math.h>
 #include <string.h>
 #include <getopt.h>
+#include <pthread.h>
 
 // Error checking macro for CUDA
 #define CUDA_CHECK(err) do { \
@@ -300,10 +301,36 @@ void testCublasLtMatmul(int m, int n, int k, bool transposeA, bool transposeB, i
     CUBLAS_CHECK(cublasDestroy(handle));
 }
 
+// Struct to pass parameters to pthread function
+struct GemmParams {
+    int m, n, k, iterations;
+    bool transposeA, transposeB;
+};
+
+// Thread functions for each GEMM test
+void* fnRunDgemm(void* arg) {
+    GemmParams* params = (GemmParams*)arg;
+    testCublasDgemm(params->m, params->n, params->k, params->transposeA, params->transposeB, params->iterations);
+    return NULL;
+}
+
+void* fnRunGemmEx(void* arg) {
+    GemmParams* params = (GemmParams*)arg;
+    testCublasGemmEx(params->m, params->n, params->k, params->transposeA, params->transposeB, params->iterations);
+    return NULL;
+}
+
+void* fnRunLtMatmul(void* arg) {
+    GemmParams* params = (GemmParams*)arg;
+    testCublasLtMatmul(params->m, params->n, params->k, params->transposeA, params->transposeB, params->iterations);
+    return NULL;
+}
+
 int main(int argc, char *argv[]) {
     int m = 4096, n = 4096, k = 4096, iterations = 10;
     bool transposeA = true, transposeB = false, verbose = false;
     bool runDgemm = true, runGemmEx = true, runLtMatmul = true;
+    bool parallel = false;
 
     // Define long options
 static struct option long_options[] = {
@@ -321,12 +348,13 @@ static struct option long_options[] = {
 	{"dgemm", required_argument, 0, 'd'},      
 	{"gemmex", required_argument, 0, 'g'},
 	{"ltmatmul", required_argument, 0, 'l'},
+        {"parallel", required_argument, 0, 'p'},
         {0, 0, 0, 0}
     };
 
     int opt;
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "m:n:k:a:b:i:v1:2:3:4:d:g:l:", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:n:k:a:b:i:v1:2:3:4:d:g:l:p:", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'm':
                 m = atoi(optarg);
@@ -370,9 +398,12 @@ static struct option long_options[] = {
             case 'l': // -ltmatmul or --ltmatmul
                 runLtMatmul = atoi(optarg) != 0;
                 break;
+            case 'p': // -parallel or --parallel
+                parallel = atoi(optarg) != 0;
+                break;
             default:
-                fprintf(stderr, "Usage: %s [--m|-m] <m> [--n|-n] <n> [--k|-k] <k> [--mn] <m=n> [--mk] <m=k> [--nk] <n=k> [--mnk] <m=n=k> [--transposeA|-a] <0/1> [--transposeB|-b] <0/1> [--iterations|-i] <iterations> [--verbose|-v] [--dgemm|-d] <0/1> [--gemmex|-g] <0/1> [--ltmatmul|-l] <0/1>\n", argv[0]);
-                fprintf(stderr, "Defaults: m=4096, n=4096, k=4096, transposeA=1, transposeB=0, iterations=10, dgemm=1, gemmex=1, ltmatmul=1\n");                
+                fprintf(stderr, "Usage: %s [--m|-m] <m> [--n|-n] <n> [--k|-k] <k> [--mn] <m=n> [--mk] <m=k> [--nk] <n=k> [--mnk] <m=n=k> [--transposeA|-a] <0/1> [--transposeB|-b] <0/1> [--iterations|-i] <iterations> [--verbose|-v] [--dgemm|-d] <0/1> [--gemmex|-g] <0/1> [--ltmatmul|-l] <0/1> [--parallel|-p] <0/1>\n", argv[0]);
+                fprintf(stderr, "Defaults: m=4096, n=4096, k=4096, transposeA=1, transposeB=0, iterations=10, dgemm=1, gemmex=1, ltmatmul=1, parallel=0\n");
                 return EXIT_FAILURE;
         }    
     }	
@@ -383,6 +414,7 @@ static struct option long_options[] = {
         printf("Iterations: %d\n", iterations);
         printf("Tests enabled: dgemm=%s, gemmex=%s, ltmatmul=%s\n",
                runDgemm ? "Yes" : "No", runGemmEx ? "Yes" : "No", runLtMatmul ? "Yes" : "No");
+        printf("Parallel execution: %s\n", parallel ? "Yes" : "No");
     }
 
     if (m <= 0 || n <= 0 || k <= 0 || iterations <= 0) {
@@ -393,15 +425,60 @@ static struct option long_options[] = {
     printf("+--------------------+------------+----------+\n");
     printf("| Operation          | Time (ms)  | T*OPS    |\n");
     printf("+--------------------+------------+----------+\n");
-    if (runDgemm) {
-        testCublasDgemm(m, n, k, transposeA, transposeB, iterations);
+    // Prepare parameters for threads
+    GemmParams params = {m, n, k, iterations, transposeA, transposeB};
+
+    if (parallel) {
+        // Count number of enabled tests
+        int numTests = (runDgemm ? 1 : 0) + (runGemmEx ? 1 : 0) + (runLtMatmul ? 1 : 0);
+        if (numTests == 0) {
+            printf("No tests enabled, exiting\n");
+            return 0;
+        }
+
+        pthread_t threads[3];
+        int threadCount = 0;
+
+        // Launch threads for enabled tests
+        if (runDgemm) {
+            if (pthread_create(&threads[threadCount++], NULL, fnRunDgemm, &params) != 0) {
+                fprintf(stderr, "Error creating dgemm thread\n");
+                return EXIT_FAILURE;
+            }
+        }
+        if (runGemmEx) {
+            if (pthread_create(&threads[threadCount++], NULL, fnRunGemmEx, &params) != 0) {
+                fprintf(stderr, "Error creating gemmex thread\n");
+                return EXIT_FAILURE;
+            }
+        }
+        if (runLtMatmul) {
+            if (pthread_create(&threads[threadCount++], NULL, fnRunLtMatmul, &params) != 0) {
+                fprintf(stderr, "Error creating ltmatmul thread\n");
+                return EXIT_FAILURE;
+            }
+        }
+
+        // Wait for all threads to complete
+        for (int i = 0; i < threadCount; i++) {
+            if (pthread_join(threads[i], NULL) != 0) {
+                fprintf(stderr, "Error joining thread %d\n", i);
+                return EXIT_FAILURE;
+            }
+        }
+    } else {
+        // Sequential execution
+        if (runDgemm) {
+            testCublasDgemm(m, n, k, transposeA, transposeB, iterations);
+        }
+        if (runGemmEx) {
+            testCublasGemmEx(m, n, k, transposeA, transposeB, iterations);
+        }
+        if (runLtMatmul) {
+            testCublasLtMatmul(m, n, k, transposeA, transposeB, iterations);
+        }
     }
-    if (runGemmEx) {
-        testCublasGemmEx(m, n, k, transposeA, transposeB, iterations);
-    }
-    if (runLtMatmul) {
-        testCublasLtMatmul(m, n, k, transposeA, transposeB, iterations);
-    }
+
     printf("+--------------------+------------+----------+\n");
 
     return 0;
