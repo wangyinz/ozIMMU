@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cublasLt.h> 
+#include <cuComplex.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -24,6 +25,89 @@
         exit(EXIT_FAILURE); \
     } \
 } while (0)
+
+// Function for cublasZgemm test
+void testCublasZgemm(int m, int n, int k, bool transposeA, bool transposeB, int iterations) {
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+
+    int lda = transposeA ? k : m;
+    int ldb = transposeB ? n : k;
+    int ldc = m;
+
+    // Allocate device memory
+    cuDoubleComplex *d_A, *d_B, *d_C;
+    cudaStream_t stream; // Renamed from malloc_stream for clarity
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUBLAS_CHECK(cublasSetStream(handle, stream)); // Use CUBLAS_CHECK for cuBLAS calls
+    CUDA_CHECK(cudaMallocAsync(&d_A, lda * (transposeA ? m : k) * sizeof(cuDoubleComplex), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_B, ldb * (transposeB ? k : n) * sizeof(cuDoubleComplex), stream));
+    CUDA_CHECK(cudaMallocAsync(&d_C, ldc * n * sizeof(cuDoubleComplex), stream));
+
+    // Initialize host matrices
+    cuDoubleComplex *h_A = (cuDoubleComplex *)malloc(lda * (transposeA ? m : k) * sizeof(cuDoubleComplex));
+    cuDoubleComplex *h_B = (cuDoubleComplex *)malloc(ldb * (transposeB ? k : n) * sizeof(cuDoubleComplex));
+    // Seed random number generator (ideally once in main)
+    // srand(time(NULL)); // Moved to main for better practice if needed only once
+    for (int i = 0; i < lda * (transposeA ? m : k); i++) {
+        h_A[i].x = (double)(rand() % 100) / 100.0; // Real part
+        h_A[i].y = (double)(rand() % 100) / 100.0; // Imaginary part
+    }
+    for (int i = 0; i < ldb * (transposeB ? k : n); i++) {
+        h_B[i].x = (double)(rand() % 100) / 100.0; // Real part
+        h_B[i].y = (double)(rand() % 100) / 100.0; // Imaginary part
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream)); // Wait for allocations before copying
+    CUDA_CHECK(cudaMemcpyAsync(d_A, h_A, lda * (transposeA ? m : k) * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_B, h_B, ldb * (transposeB ? k : n) * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice, stream));
+
+    // Set transpose operations
+    cublasOperation_t opA = transposeA ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t opB = transposeB ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    // Define scalars for Zgemm (complex double precision)
+    cuDoubleComplex alpha = make_cuDoubleComplex(1.0, 0.0);
+    cuDoubleComplex beta = make_cuDoubleComplex(0.0, 0.0);
+
+    // Timing setup
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaStreamSynchronize(stream)); // Wait for copies before warm-up
+    float milliseconds = 0.0;
+
+    // Warm-up
+    CUBLAS_CHECK(cublasZgemm(handle, opA, opB, m, n, k, &alpha, d_A, lda, d_B, ldb, &beta, d_C, ldc));
+    CUDA_CHECK(cudaStreamSynchronize(stream)); // Wait for warm-up before starting timer
+
+    // Timed run
+    CUDA_CHECK(cudaEventRecord(start, stream)); // Record on the same stream used for ops
+    for (int i = 0; i < iterations; i++) {
+        CUBLAS_CHECK(cublasZgemm(handle, opA, opB, m, n, k, &alpha, d_A, lda, d_B, ldb, &beta, d_C, ldc));
+    }
+    CUDA_CHECK(cudaEventRecord(stop, stream)); // Record on the same stream
+
+    CUDA_CHECK(cudaEventSynchronize(stop)); // Wait for all operations to complete
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+
+    // Compute TFLOPS
+    // Note: Complex GEMM involves more operations (typically ~8 per element vs ~2 for real).
+    double flops = 8.0 * (double)m * (double)n * (double)k * iterations;
+    double tflops = (flops / (milliseconds / 1000.0)) / 1e12;
+    printf("| Zgemm              | %10.3f | %8.3f |\n", milliseconds/iterations, tflops);
+
+    // Clean up
+    free(h_A);
+    free(h_B);
+    CUDA_CHECK(cudaFreeAsync(d_A, stream));
+    CUDA_CHECK(cudaFreeAsync(d_B, stream));
+    CUDA_CHECK(cudaFreeAsync(d_C, stream));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaStreamDestroy(stream)); // Destroy the stream
+    CUBLAS_CHECK(cublasDestroy(handle));
+}
 
 // Function for cublasDgemm test
 void testCublasDgemm(int m, int n, int k, bool transposeA, bool transposeB, int iterations) {
@@ -308,6 +392,12 @@ struct GemmParams {
 };
 
 // Thread functions for each GEMM test
+void* fnRunZgemm(void* arg) {
+    GemmParams* params = (GemmParams*)arg;
+    testCublasZgemm(params->m, params->n, params->k, params->transposeA, params->transposeB, params->iterations);
+    return NULL;
+}
+
 void* fnRunDgemm(void* arg) {
     GemmParams* params = (GemmParams*)arg;
     testCublasDgemm(params->m, params->n, params->k, params->transposeA, params->transposeB, params->iterations);
@@ -329,7 +419,7 @@ void* fnRunLtMatmul(void* arg) {
 int main(int argc, char *argv[]) {
     int m = 4096, n = 4096, k = 4096, iterations = 10;
     bool transposeA = true, transposeB = false, verbose = false;
-    bool runDgemm = true, runGemmEx = true, runLtMatmul = true;
+    bool runZgemm = false, runDgemm = true, runGemmEx = true, runLtMatmul = true;
     bool parallel = false;
 
     // Define long options
@@ -346,6 +436,7 @@ static struct option long_options[] = {
         {"nk", required_argument, 0, '3'},
         {"mnk", required_argument, 0, '4'},
 	{"dgemm", required_argument, 0, 'd'},      
+        {"zgemm", required_argument, 0, 'z'},
 	{"gemmex", required_argument, 0, 'g'},
 	{"ltmatmul", required_argument, 0, 'l'},
         {"parallel", required_argument, 0, 'p'},
@@ -354,7 +445,7 @@ static struct option long_options[] = {
 
     int opt;
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "m:n:k:a:b:i:v1:2:3:4:d:g:l:p:", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:n:k:a:b:i:v1:2:3:4:z:d:g:l:p:", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'm':
                 m = atoi(optarg);
@@ -389,6 +480,9 @@ static struct option long_options[] = {
             case '4': // -mnk or --mnk
                 m = n = k = atoi(optarg);
                 break;
+            case 'z': 
+                runZgemm = atoi(optarg) != 0; 
+                break;
             case 'd': // -dgemm or --dgemm
                 runDgemm = atoi(optarg) != 0;
                 break;
@@ -402,8 +496,8 @@ static struct option long_options[] = {
                 parallel = atoi(optarg) != 0;
                 break;
             default:
-                fprintf(stderr, "Usage: %s [--m|-m] <m> [--n|-n] <n> [--k|-k] <k> [--mn] <m=n> [--mk] <m=k> [--nk] <n=k> [--mnk] <m=n=k> [--transposeA|-a] <0/1> [--transposeB|-b] <0/1> [--iterations|-i] <iterations> [--verbose|-v] [--dgemm|-d] <0/1> [--gemmex|-g] <0/1> [--ltmatmul|-l] <0/1> [--parallel|-p] <0/1>\n", argv[0]);
-                fprintf(stderr, "Defaults: m=4096, n=4096, k=4096, transposeA=1, transposeB=0, iterations=10, dgemm=1, gemmex=1, ltmatmul=1, parallel=0\n");
+                fprintf(stderr, "Usage: %s [--m|-m] <m> [--n|-n] <n> [--k|-k] <k> [--mn] <m=n> [--mk] <m=k> [--nk] <n=k> [--mnk] <m=n=k> [--transposeA|-a] <0/1> [--transposeB|-b] <0/1> [--iterations|-i] <iterations> [--verbose|-v] [--dgemm|-d] <0/1> [--gemmex|-g] <0/1> [--ltmatmul|-l] <0/1> [--zgemm|-z] <0/1> [--parallel|-p] <0/1>\n", argv[0]);
+                fprintf(stderr, "Defaults: m=4096, n=4096, k=4096, transposeA=1, transposeB=0, iterations=10, dgemm=1, gemmex=1, ltmatmul=1, zgemm=0, parallel=0\n");
                 return EXIT_FAILURE;
         }    
     }	
@@ -430,19 +524,25 @@ static struct option long_options[] = {
 
     if (parallel) {
         // Count number of enabled tests
-        int numTests = (runDgemm ? 1 : 0) + (runGemmEx ? 1 : 0) + (runLtMatmul ? 1 : 0);
+        int numTests = (runDgemm ? 1 : 0) + (runGemmEx ? 1 : 0) + (runLtMatmul ? 1 : 0) + (runZgemm ? 1 : 0);
         if (numTests == 0) {
             printf("No tests enabled, exiting\n");
             return 0;
         }
 
-        pthread_t threads[3];
+        pthread_t threads[4];
         int threadCount = 0;
 
         // Launch threads for enabled tests
         if (runDgemm) {
             if (pthread_create(&threads[threadCount++], NULL, fnRunDgemm, &params) != 0) {
                 fprintf(stderr, "Error creating dgemm thread\n");
+                return EXIT_FAILURE;
+            }
+        }
+        if (runZgemm) { // <-- Add thread creation for Zgemm
+            if (pthread_create(&threads[threadCount++], NULL, fnRunZgemm, &params) != 0) {
+                fprintf(stderr, "Error creating zgemm thread\n"); 
                 return EXIT_FAILURE;
             }
         }
@@ -470,6 +570,10 @@ static struct option long_options[] = {
         // Sequential execution
         if (runDgemm) {
             testCublasDgemm(m, n, k, transposeA, transposeB, iterations);
+        }
+
+        if (runZgemm) { 
+             testCublasZgemm(m, n, k, transposeA, transposeB, iterations);
         }
         if (runGemmEx) {
             testCublasGemmEx(m, n, k, transposeA, transposeB, iterations);
