@@ -25,6 +25,54 @@ std::size_t split_core(void *const split_ptr, const mtk::ozimmu::operation_t op,
   return offset;
 }
 
+//=====
+// This function is added
+//=====
+void split_AB_int8_nearest(
+	mtk::ozimmu::handle_t handle,
+	const mtk::ozimmu::operation_t op_A,
+	const mtk::ozimmu::operation_t op_B,
+	const std::size_t m,
+	const std::size_t n,
+	const std::size_t k,
+	const double* const a_ptr, const std::size_t lda,
+	double* const sft_a,
+	std::int8_t* const working_a_ptr, const std::uint32_t ld_int8_a,
+	const double* const b_ptr, const std::size_t ldb,
+	double* const sft_b,
+	std::int8_t* const working_b_ptr, const std::uint32_t ld_int8_b,
+	const std::int8_t num_split,
+	const std::int8_t bits
+) {
+	handle->profiler.start_timer_sync("split_A_near");
+	mtk::ozimmu::split_int8_nearest(
+			working_a_ptr, ld_int8_a,
+			sft_a,
+			m, k,
+			a_ptr, lda,
+			op_A,
+			mtk::ozimmu::detail::matrix_A,
+			num_split,
+			bits,
+			handle->cuda_stream
+			);
+	handle->profiler.stop_timer_sync("split_A_near");
+
+	handle->profiler.start_timer_sync("split_B_near");
+	mtk::ozimmu::split_int8_nearest(
+			working_b_ptr, ld_int8_b,
+			sft_b,
+			k, n,
+			b_ptr, ldb,
+			op_B,
+			mtk::ozimmu::detail::matrix_B,
+			num_split,
+			bits,
+			handle->cuda_stream
+			);
+	handle->profiler.stop_timer_sync("split_B_near");
+}
+
 template <class T>
 void split_AB_int8(
     mtk::ozimmu::handle_t handle, const mtk::ozimmu::operation_t op_A,
@@ -72,6 +120,106 @@ cublasOperation_t to_cublasOperation_t(const mtk::ozimmu::operation_t op) {
   }
   OZIMMU_NOT_IMPLEMENTED;
   return CUBLAS_OP_N;
+}
+
+//=====
+// This function is added
+//=====
+__global__ void accumulate_in_f64_kernel_2(
+	const std::size_t m,
+	double* const f64_ptr,
+	const std::int32_t* i32_ptr,
+	const std::size_t length,
+	const double* const sft_a,
+	const double* const sft_b,
+	const double scale
+) {
+	const auto tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= length) {
+		return;
+	}
+
+	const auto mi = tid % m;
+	const auto ni = tid / m;
+	f64_ptr[tid] +=  static_cast<double>(i32_ptr[tid])*sft_a[mi]*sft_b[ni]*scale;
+}
+
+//=====
+// This function is added
+//=====
+void accumulate_in_f64_2(
+	const std::size_t m,
+	double* const f64_ptr,
+	const std::int32_t* i32_ptr,
+	const std::size_t length,
+	const double* const sft_a,
+	const double* const sft_b,
+	const double sft,
+	cudaStream_t cuda_stream
+) {
+	constexpr std::size_t block_size = 256;
+	accumulate_in_f64_kernel_2
+		<<<(length + block_size - 1) / block_size, block_size, 0, cuda_stream>>>(
+				m,
+				f64_ptr,
+				i32_ptr,
+				length,
+				sft_a,
+				sft_b,
+				sft
+			);
+}
+
+//=====
+// This function is added
+//=====
+__global__ void axby_kernel_2(
+	const std::size_t m,
+	const std::size_t n,
+	const double a,
+	const double* const x_ptr,
+	const double b,
+	double* const y_ptr,
+	const std::size_t ldy
+	) {
+  const auto tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= m * n) {
+    return;
+  }
+
+  const auto mi = tid % m;
+  const auto ni = tid / m;
+  const auto memory_index = ni * ldy + mi;
+
+  if (b != 0) {
+    y_ptr[memory_index] = a * x_ptr[tid] + b * y_ptr[memory_index];
+  } else {
+    y_ptr[memory_index] = a * x_ptr[tid];
+  }
+}
+
+//=====
+// This function is added
+//=====
+void axby_2(
+	const std::size_t m,
+	const std::size_t n,
+	const double a,
+	const double* const x_ptr,
+	const double b,
+	double* const y_ptr,
+	const std::size_t ldy,
+	cudaStream_t cuda_stream
+	) {
+  constexpr std::size_t block_size = 256;
+  axby_kernel_2
+    <<<(m * n + block_size - 1) / block_size, block_size, 0, cuda_stream>>>(
+        m, n,
+        a,
+        x_ptr,
+        b,
+        y_ptr, ldy
+      );
 }
 
 __global__ void accumulate_in_f64_kernel(double *const f64_ptr,
@@ -253,8 +401,8 @@ cublasStatus_t cublasGemmEx_org(cublasHandle_t handle, cublasOperation_t transa,
       const void *, const void *, cudaDataType_t, int, const void *,
       cudaDataType_t, int, const void *, void *, cudaDataType_t, int,
       cublasComputeType_t, cublasGemmAlgo_t);
-  *(void **)(&func_ptr) =
-      ozIMMU_get_function_pointer(cublas_function_name.c_str());
+  *(void **)(&func_ptr) = ozIMMU_get_function_pointer(
+    cublas_function_name.c_str(), cublas_library_name.c_str());
 
   const auto res =
       (*func_ptr)(handle, transa, transb, m, n, k, alpha, A, Atype, lda, B,
@@ -269,7 +417,7 @@ void matmul_core(
     const std::size_t n, const std::size_t k, const void *const a_ptr,
     const std::size_t lda, const mtk::ozimmu::data_t type_a,
     const void *const b_ptr, const std::size_t ldb,
-    const mtk::ozimmu::data_t type_b, void *const c_ptr,
+    const mtk::ozimmu::data_t type_b, const int beta_i, void *const c_ptr,
     const mtk::ozimmu::detail::gemm_pair_config_t &gemm_pair_config,
     const mtk::ozimmu::compute_mode_t compute_mode,
     const void *const a_working_memory_ptr, const std::size_t ld_w_a,
@@ -313,7 +461,7 @@ void matmul_core(
   handle->profiler.start_timer_sync(profile_label);
   switch (gemm_mode) {
   case mtk::ozimmu::detail::int8tc: {
-    const int alpha_i = 1, beta_i = 0;
+    const int alpha_i = 1;
     const auto op_A_r =
         gemm_pair_config.A_id == 0 ? to_cublasOperation_t(op_A) : CUBLAS_OP_T;
     const auto op_B_r =
@@ -341,6 +489,9 @@ int gemm_int8(mtk::ozimmu::handle_t handle, const mtk::ozimmu::operation_t op_A,
               const std::size_t ldb, const T *beta, T *const c_ptr,
               std::size_t ldc, const mtk::ozimmu::compute_mode_t compute_mode);
 
+//=====
+// This function is changed
+//=====
 template <>
 int gemm_int8<double>(mtk::ozimmu::handle_t handle,
                       const mtk::ozimmu::operation_t op_A,
@@ -351,13 +502,12 @@ int gemm_int8<double>(mtk::ozimmu::handle_t handle,
                       const std::size_t ldb, const double *beta,
                       double *const c_ptr, std::size_t ldc,
                       const mtk::ozimmu::compute_mode_t compute_mode) {
-  const unsigned num_split = mtk::ozimmu::detail::get_split_config(compute_mode)
-                                 .matrix_A_split_types.size() -
-                             1;
-  const int32_t bits_per_int8 = mtk::ozimmu::get_bits_per_int8(k);
+  const std::int8_t num_split = mtk::ozimmu::detail::get_split_config(compute_mode)
+                                  .matrix_A_split_types.size() -
+                              1;
+  const std::int8_t bits_per_int8 = mtk::ozimmu::get_bits_per_int8(k);
 
-  double *const c_f64_ptr =
-      reinterpret_cast<double *>(handle->working_memory_ptr);
+  double *const c_f64_ptr = reinterpret_cast<double *>(handle->working_memory_ptr);
   double *const a_max_exp_ptr = c_f64_ptr + m * n;
   double *const b_max_exp_ptr = a_max_exp_ptr + m;
   std::int32_t *const c_i32_ptr =
@@ -378,33 +528,101 @@ int gemm_int8<double>(mtk::ozimmu::handle_t handle,
   auto a_int8_slices_ptr = reinterpret_cast<std::int8_t *>(working_memory_ptr);
   auto b_int8_slices_ptr = a_int8_slices_ptr + A_working_memory_size;
 
-  split_AB_int8<double>(handle, op_A, op_B, m, n, k, a_ptr, lda, a_max_exp_ptr,
-                        a_int8_slices_ptr, ld_int8_a, b_ptr, ldb, b_max_exp_ptr,
-                        b_int8_slices_ptr, ld_int8_b, num_split, bits_per_int8);
+  split_AB_int8_nearest(
+    handle,
+    op_A,
+    op_B,
+    m, n, k, a_ptr, lda,
+    a_max_exp_ptr,
+    a_int8_slices_ptr, ld_int8_a,
+    b_ptr, ldb,
+    b_max_exp_ptr,
+    b_int8_slices_ptr, ld_int8_b,
+    num_split,
+    bits_per_int8
+    );
+
+  int lim_accum = 31 - bits_per_int8 - bits_per_int8 - ceil(log2(k));
+  int beta_i = 0;
+  int p = -1;
 
   const auto &gemm_pair_config_list =
       mtk::ozimmu::detail::get_split_config(compute_mode).gemm_pair_config_list;
-  for (const auto &gemm_pair_config : gemm_pair_config_list) {
-    matmul_core(handle, op_A, op_B, m, n,
-                ld_int8_a, // use ld_int8_a instead of k for better stability
-                a_ptr, lda, mtk::ozimmu::fp64, b_ptr, ldb, mtk::ozimmu::fp64,
-                c_i32_ptr, gemm_pair_config, compute_mode, a_int8_slices_ptr,
-                ld_int8_a, b_int8_slices_ptr, ld_int8_b);
-    handle->profiler.start_timer_sync("accumulate_in_f64");
-    accumulate_in_f64(
-        c_f64_ptr, c_i32_ptr, m * n,
-        bits_per_int8 * (gemm_pair_config.A_id + gemm_pair_config.B_id - 2) -
-            (7 /*bitlen(int8)-1*/ - bits_per_int8) *
-                2, // The `(7 - bits_per_int8) * 2` term is required because the
-                   // mantissa `bits_per_int8` bits are stored in the low
-                   // `bits_per_int8` bits of an int8.
-        handle->cuda_stream);
-    handle->profiler.stop_timer_sync("accumulate_in_f64");
+
+  
+	if (lim_accum == 0) {
+
+    //=====
+    // Group-wise error-free summation cannot be applied
+    //=====
+    for (const auto &gemm_pair_config : gemm_pair_config_list) {
+      matmul_core(handle, op_A, op_B, m, n,
+                  ld_int8_a, // use ld_int8_a instead of k for better stability
+                  a_ptr, lda, mtk::ozimmu::fp64, b_ptr, ldb, mtk::ozimmu::fp64,
+                  beta_i, c_i32_ptr, gemm_pair_config, compute_mode, a_int8_slices_ptr,
+                  ld_int8_a, b_int8_slices_ptr, ld_int8_b);
+      handle->profiler.start_timer_sync("accumulate_in_f64_2");
+      accumulate_in_f64_2(
+          m,
+          c_f64_ptr,
+          c_i32_ptr,
+          m * n,
+          a_max_exp_ptr,
+          b_max_exp_ptr,
+          ldexp(1.0,-bits_per_int8*(gemm_pair_config.A_id + gemm_pair_config.B_id - 2)),
+          handle->cuda_stream
+          );
+      handle->profiler.stop_timer_sync("accumulate_in_f64_2");
+    }
+
+  } else {
+
+    //=====
+    // Group-wise error-free summation
+    //=====
+		lim_accum = 1<<lim_accum;
+    for (const auto &gemm_pair_config : gemm_pair_config_list) {
+			if (gemm_pair_config.A_id == 1) p++;
+			if ((gemm_pair_config.A_id-1) % lim_accum == 0) beta_i = 0;
+
+      matmul_core(handle, op_A, op_B, m, n,
+                  ld_int8_a, // use ld_int8_a instead of k for better stability
+                  a_ptr, lda, mtk::ozimmu::fp64, b_ptr, ldb, mtk::ozimmu::fp64,
+                  beta_i, c_i32_ptr, gemm_pair_config, compute_mode, a_int8_slices_ptr,
+                  ld_int8_a, b_int8_slices_ptr, ld_int8_b);
+                  
+			beta_i = 1;
+			if ((gemm_pair_config.A_id-1) == p 
+        || ((gemm_pair_config.A_id % lim_accum == 0) && gemm_pair_config.A_id > 1)) {
+
+				handle->profiler.start_timer_sync("accumulate_in_f64_2");
+				accumulate_in_f64_2(
+						m,
+						c_f64_ptr,
+						c_i32_ptr,
+						m * n,
+						a_max_exp_ptr,
+						b_max_exp_ptr,
+            ldexp(1.0,-bits_per_int8*(gemm_pair_config.A_id + gemm_pair_config.B_id - 2)),
+						handle->cuda_stream
+						);
+				handle->profiler.stop_timer_sync("accumulate_in_f64_2");
+
+      }
+    }
+    
   }
-  handle->profiler.start_timer_sync("copy_result");
-  axby(m, n, *alpha, c_f64_ptr, *beta, c_ptr, ldc, a_max_exp_ptr, b_max_exp_ptr,
-       handle->cuda_stream);
-  handle->profiler.stop_timer_sync("copy_result");
+  
+  handle->profiler.start_timer_sync("copy_result_2");
+	axby_2(
+		m, n,
+		*alpha,
+		c_f64_ptr,
+		*beta,
+		c_ptr, ldc,
+		handle->cuda_stream
+		);
+  handle->profiler.stop_timer_sync("copy_result_2");
 
   return 0;
 }
@@ -483,7 +701,7 @@ int gemm_int8<cuDoubleComplex>(
       matmul_core(handle, mtk::ozimmu::op_t, mtk::ozimmu::op_n, m, n,
                   ld_int8_a, // use ld_int8_a instead of k for better stability
                   a_ptr, lda, mtk::ozimmu::fp64, b_ptr, ldb, mtk::ozimmu::fp64,
-                  c_i32_ptr, gemm_pair_config, compute_mode,
+                  0, c_i32_ptr, gemm_pair_config, compute_mode,
                   a_int8_working_memory_ptr_list[p.first], ld_int8_a,
                   b_int8_working_memory_ptr_list[p.second], ld_int8_b);
       handle->profiler.start_timer_sync("accumulate_in_f64");

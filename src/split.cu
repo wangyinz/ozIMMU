@@ -10,60 +10,227 @@
 #include <ozimmu/ozimmu.hpp>
 
 namespace {
+	//=====
+	// This function is added
+	//=====
+  __device__ short get_exp_npt(double x) {
+      // uint64_t bits = *reinterpret_cast<uint64_t *>(&x);
+      // short is_small  = ((bits >> 52) & 0x7FF) <= 0x3FF;
+      // x *= (is_small * 4.4942328371557898e+307 + !is_small);
+      // bits         = *reinterpret_cast<uint64_t *>(&x);
+      // short exponent = ((bits >> 52) & 0x7FF) - 1023 - is_small * 1022;
+      // return exponent + ((bits & 0xFFFFFFFFFFFFF) != 0);
+      x *= 18014398509481984.0;
+      uint64_t bits  = *reinterpret_cast<uint64_t *>(&x);
+      short exponent = ((bits >> 52) & 0x7FF) - 1077;
+      return exponent + ((bits & 0xFFFFFFFFFFFFF) != 0);
+  }
+  
+	//=====
+	// This function is added
+	//=====
+  __device__ double get_npt(double x) {
+    x = fabs(x);
+    constexpr double a = 9.0071992547409920e+15;
+    constexpr double b = -9.0071992547409910e+15;
+    return fma(x,a,b*x);
+  }
+
+	//=====
+	// This function is added
+	//=====
+	__device__ double find_amax(
+		const double * const ptr,	// length * inc
+		const unsigned length,
+		const unsigned inc,
+		typename mtk::ozimmu::detail::real_type<double>::type* const shm
+	) {
+		// max in thread
+		double amax = 0.;
+    const unsigned step = inc * blockDim.x;
+		unsigned i = threadIdx.x;
+		const double* in_ptr = ptr + i * inc;
+		for (; i < length; i += blockDim.x) {
+			const double tmp = fabs(*in_ptr);
+			if (amax < tmp) amax = tmp;
+			in_ptr += step;
+		}
+	
+		// inner-warp reduction
+		for (unsigned offset = 16; offset >= 1; offset >>= 1) {
+			const double tmp = __shfl_xor_sync(0xFFFFFFFF, amax, offset);			// reduction in warp like binary-tree
+			if (amax < tmp) amax = tmp;										// max in warp
+		}
+	
+		// inner-threadblock reduction
+		if ((threadIdx.x & 0x1f) == 0) shm[threadIdx.x >> 5] = amax;			// shm[warp-id] = max in warp
+	
+		__syncthreads();
+		amax = 0.;
+		if (threadIdx.x < 32) {
+			if (threadIdx.x < (blockDim.x >> 5)) {
+				amax = shm[threadIdx.x];									// amax in (warp-id)th thread := shm[warp-id]
+			}
+			#pragma unroll
+			for (unsigned offset = 16; offset >= 1; offset >>= 1) {
+				const double tmp = __shfl_xor_sync(0xFFFFFFFF, amax, offset);		// reduction in warp like binary-tree
+				if (amax < tmp) amax = tmp;
+			}
+			if (threadIdx.x == 0) {
+				shm[0] = amax;												// max(abs(devA(:,ibx)))
+			}
+		}
+		
+		__syncthreads();
+		return shm[0];
+	}
+
+	//=====
+	// This function is added
+	//=====
+  __device__ void extract_int8_core(
+    std::int8_t* const out_ptr,
+    const std::size_t inc,
+    double a,
+    double t,	// 1.5 * 2^46 * npt(max(a))
+    double s,	// 2^6 / npt(max(a))
+    double t_inc,
+    double s_inc,
+    const std::int8_t num_split
+  ) {
+    for (unsigned i = 0; i < num_split; ++i) {
+      double a_i = (a+t)-t;
+      a -= a_i;
+      out_ptr[i * inc] = static_cast<std::int8_t>(a_i*s);
+      t *= t_inc;
+      s *= s_inc;
+    }
+  }
+	
+	//=====
+	// This function is added
+	//=====
+	__global__ void extract_int8_kernel(
+		std::int8_t* const out_ptr,
+		const std::uint32_t ldo,
+		double* const sft,
+		const std::size_t m,
+		const std::size_t n,
+		const double* const in_ptr,
+		const std::size_t ld,
+		const std::int8_t num_split,
+		const std::int8_t bits,
+		const bool col_major
+		) {
+		__shared__ typename mtk::ozimmu::detail::real_type<double>::type smem[32];
+		const auto row_index = blockIdx.x;
+    const auto amax = find_amax(in_ptr + (col_major ? row_index : (row_index * ld)), 
+                                n, (col_major ? ld : 1), smem);
+		
+		const auto N = m * ldo;
+
+    // double NPT = get_npt(amax);
+    // double t = ldexp(1.5 * NPT, 53 - bits); // (1l<<(53 - bits)) * 1.5 * NPT;
+    // double s = (1<<(bits - 1)) / NPT;
+
+    const short log2_npt = get_exp_npt(amax);
+    double t = ldexp(1.5, 53 - bits + log2_npt);
+    double s_inc = 1<<bits;
+    double s = ldexp(s_inc, - 1 - log2_npt);
+    double t_inc = 1.0/s_inc;
+    unsigned i;
+    for (i = threadIdx.x; i < n; i += blockDim.x) {
+      double a = in_ptr[(col_major ? (i * ld + row_index) : (i + row_index * ld))];
+      extract_int8_core(out_ptr + row_index * ldo + i, N, a, t, s, t_inc, s_inc, num_split);
+    }
+    // Fill the padding elements with zeros
+    for (; i < ldo; i += blockDim.x) {
+      for (std::uint32_t j = 0; j < num_split; j++) {
+        *(out_ptr + row_index * ldo + i + j * N) = 0;
+      }
+    }
+  
+    if (threadIdx.x == 0) {
+      sft[blockIdx.x] = 1.0/s;
+    }
+
+	}
+	
+	//=====
+	// This function is added
+	//=====
+	void split_int8_A_nearest(
+		std::int8_t* const out_ptr,
+		const std::uint32_t ldo,
+		double* const sft,
+		const mtk::ozimmu::operation_t op,
+		const std::size_t m,
+		const std::size_t n,
+    const double* const in_ptr,
+		const std::size_t ld,
+		const std::int8_t num_split,
+		const std::int8_t bits,
+		cudaStream_t cuda_stream
+	) {
+		const dim3 block_size = 256;
+		const dim3 grid_size = m;
+	
+		const bool is_col_major = op == mtk::ozimmu::op_n;
+	
+		extract_int8_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
+					out_ptr,
+          ldo,
+					sft,
+					m, n,
+					in_ptr, 
+					ld,
+					num_split,
+					bits,
+					is_col_major
+					);
+	}
+
 template <class T>
 __device__ T get_exp_max_element(
-    // [length * inc]
-    const T *const ptr, const unsigned length, const unsigned inc,
-    // [blockDim.x / warp_size]
-    typename mtk::ozimmu::detail::real_type<T>::type *const working_smem_ptr) {
-  using bs_t = typename cutf::experimental::fp::same_size_uint<T>::type;
+  const T *const ptr, const unsigned length, const unsigned inc,
+	typename mtk::ozimmu::detail::real_type<double>::type* const shm) {
+	// max in thread
+	double amax = 0.;
+	unsigned i = threadIdx.x;
+	const double* in_ptr = ptr + i * inc;
+	for (; i < length; i += blockDim.x) {
+		const double tmp = fabs(*in_ptr);
+		if (amax < tmp) amax = tmp;
+		in_ptr += inc * blockDim.x;
+	}
 
-  T local_abs_max = 0;
+	// inner-warp reduction
+	for (unsigned offset = 16; offset >= 1; offset >>= 1) {
+		const double tmp = __shfl_xor_sync(~0u, amax, offset);			// reduction in warp like binary-tree
+		if (amax < tmp) amax = tmp;										// max in warp
+	}
 
-  unsigned i = threadIdx.x;
-  const T *local_ptr = ptr + i * inc;
-  for (; i < length; i += blockDim.x) {
-    const auto v = cutf::experimental::fp::reinterpret_as_fp(
-        cutf::experimental::fp::mask_exponent(*local_ptr));
+	// inner-threadblock reduction
+	if ((threadIdx.x & 0x1f) == 0) shm[threadIdx.x >> 5] = amax;			// shm[warp-id] = max in warp
 
-    local_abs_max = cutf::math::max(local_abs_max, v);
-
-    local_ptr += inc * blockDim.x;
-  }
-
-  // Inner-warp reduction
-  for (std::uint32_t offset = cutf::thread::warp_size_const >> 1; offset >= 1;
-       offset >>= 1) {
-    local_abs_max = cutf::math::max(__shfl_xor_sync(~0u, local_abs_max, offset),
-                                    local_abs_max);
-  }
-
-  // Inner-threadblock reduction
-  if ((threadIdx.x & 0x1f) == 0) {
-    working_smem_ptr[threadIdx.x >> 5] = local_abs_max;
-  }
-
-  __syncthreads();
-  local_abs_max = 0;
-  if (threadIdx.x < cutf::thread::warp_size_const) {
-    if (threadIdx.x < (blockDim.x / cutf::thread::warp_size_const)) {
-      local_abs_max = working_smem_ptr[threadIdx.x];
-    }
-
-    for (std::uint32_t offset = cutf::thread::warp_size_const >> 1; offset >= 1;
-         offset >>= 1) {
-      local_abs_max = cutf::math::max(
-          __shfl_xor_sync(~0u, local_abs_max, offset), local_abs_max);
-    }
-
-    if (threadIdx.x == 0) {
-      working_smem_ptr[0] = local_abs_max;
-    }
-  }
-
-  __syncthreads();
-
-  return working_smem_ptr[0];
+	__syncthreads();
+	amax = 0.;
+	if (threadIdx.x < 32) {
+		if (threadIdx.x < (blockDim.x >> 5)) {
+			amax = shm[threadIdx.x];									// amax in (warp-id)th thread := shm[warp-id]
+		}
+		#pragma unroll
+		for (unsigned offset = 16; offset >= 1; offset >>= 1) {
+			const double tmp = __shfl_xor_sync(~0u, amax, offset);		// reduction in warp like binary-tree
+			if (amax < tmp) amax = tmp;
+		}
+		if (threadIdx.x == 0) {
+			shm[0] = amax;												// max(abs(devA(:,ibx)))
+		}
+	}
+	
+	__syncthreads();
+	return shm[0];
 }
 
 template <>
@@ -153,35 +320,31 @@ __device__ cuDoubleComplex get_exp_max_element<cuDoubleComplex>(
 
 template <class INPUT_T, class MANTISSA_T>
 __device__ void cut_int8_core(std::int8_t *const out_ptr, const std::size_t inc,
-                              const INPUT_T a, const INPUT_T max_exp,
-                              const unsigned num_split,
-                              const unsigned mantissa_length) {
-  const std::uint8_t sign_flag = a > 0;
-  // When the input number is not normalized, don't set the implicit one bit.
-  const std::uint64_t implict_one_bit =
-      cutf::experimental::fp::mask_exponent(a) ? 1lu : 0lu;
-  const auto mantissa =
-      static_cast<MANTISSA_T>(
-          cutf::experimental::fp::mask_mantissa(a) |
-          (implict_one_bit
-           << cutf::experimental::fp::get_mantissa_size<INPUT_T>()))
-      << ((sizeof(MANTISSA_T) - sizeof(INPUT_T)) * 8 +
-          cutf::experimental::fp::get_exponent_size<INPUT_T>());
-  const auto mantissa_shift_offset =
-      (cutf::experimental::fp::reinterpret_as_uint(max_exp) -
-       cutf::experimental::fp::mask_exponent(a)) >>
-      cutf::experimental::fp::get_mantissa_size<INPUT_T>();
+                            const INPUT_T a, const INPUT_T max_exp,
+                            const unsigned num_split,
+                            const unsigned mantissa_length) {
+const std::uint8_t sign_flag = a > 0;
+const auto mantissa =
+    static_cast<MANTISSA_T>(
+        cutf::experimental::fp::mask_mantissa(a) |
+        (1lu << cutf::experimental::fp::get_mantissa_size<INPUT_T>()))
+    << ((sizeof(MANTISSA_T) - sizeof(INPUT_T)) * 8 +
+        cutf::experimental::fp::get_exponent_size<INPUT_T>());
+const auto mantissa_shift_offset =
+    (cutf::experimental::fp::reinterpret_as_uint(max_exp) -
+     cutf::experimental::fp::mask_exponent(a)) >>
+    cutf::experimental::fp::get_mantissa_size<INPUT_T>();
 
-  auto shifted_mantissa = mantissa >> mantissa_shift_offset;
-  for (unsigned s = 0; s < num_split; s++) {
-    const std::int8_t int8 =
-        static_cast<std::int8_t>(shifted_mantissa >>
-                                 (sizeof(MANTISSA_T) * 8 - mantissa_length)) *
-        (sign_flag ? 1 : -1);
-    shifted_mantissa <<= mantissa_length;
+auto shifted_mantissa = mantissa >> mantissa_shift_offset;
+for (unsigned s = 0; s < num_split; s++) {
+  const std::int8_t int8 =
+      static_cast<std::int8_t>(shifted_mantissa >>
+                               (sizeof(MANTISSA_T) * 8 - mantissa_length)) *
+      (sign_flag ? 1 : -1);
+  shifted_mantissa <<= mantissa_length;
 
-    out_ptr[s * inc] = int8;
-  }
+  out_ptr[s * inc] = int8;
+}
 }
 
 __device__ cuDoubleComplex x2(const cuDoubleComplex a) {
@@ -262,6 +425,51 @@ void split_int8_A(
 }
 
 } // unnamed namespace
+
+
+//=====
+// This function is added
+//=====
+void mtk::ozimmu::split_int8_nearest(
+    std::int8_t *const out_ptr, 
+	const std::uint32_t ldo,
+    double *const sft,
+    const std::size_t m,
+    const std::size_t n,
+    const double *const in_ptr,
+    const std::size_t ld,
+    const mtk::ozimmu::operation_t op,
+    const mtk::ozimmu::detail::matrix_t matrix,
+    const std::int8_t num_split,
+    const std::int8_t bits,
+    const cudaStream_t cuda_stream
+) {
+	if (matrix == mtk::ozimmu::detail::matrix_A) {
+		split_int8_A_nearest(
+				out_ptr,
+				ldo, 
+				sft,
+				op,
+				m, n,
+				in_ptr, ld,
+				num_split,
+				bits,
+				cuda_stream
+				);
+	} else {
+		split_int8_A_nearest(
+				out_ptr,
+				ldo, 
+				sft,
+				op == mtk::ozimmu::op_n ? mtk::ozimmu::op_t : mtk::ozimmu::op_n,
+				n, m,
+				in_ptr, ld,
+				num_split,
+				bits,
+				cuda_stream
+				);
+	}
+}
 
 template <class T>
 void mtk::ozimmu::split_int8(
