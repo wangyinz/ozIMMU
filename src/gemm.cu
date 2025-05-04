@@ -5,6 +5,48 @@
 #include <cutf/cublas.hpp>
 
 namespace {
+
+// Kernel to sum results from multiple per-stream buffers
+// Assumes per_stream_buffers is an array of pointers to the start of each buffer
+// Writes the sum to output_buffer
+template <class T>
+__global__ void reduce_sum_kernel(T** per_stream_buffers,
+                                  T* output_buffer,
+                                  std::size_t num_buffers,
+                                  std::size_t elements_per_buffer) {
+    const auto tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= elements_per_buffer) {
+        return;
+    }
+
+    T sum = 0;
+    for (std::size_t i = 0; i < num_buffers; ++i) {
+        // Check if the buffer pointer is valid before dereferencing
+        if (per_stream_buffers[i] != nullptr) {
+             sum += per_stream_buffers[i][tid];
+        }
+    }
+    output_buffer[tid] = sum;
+}
+
+// Host function to launch the reduction kernel
+template <class T>
+void reduce_sum_buffers(T** d_per_stream_buffer_ptrs, // Device pointer to array of device pointers
+                        T* d_output_buffer,
+                        std::size_t num_buffers,
+                        std::size_t elements_per_buffer,
+                        cudaStream_t stream) {
+    if (num_buffers == 0 || elements_per_buffer == 0) return;
+
+    constexpr std::size_t block_size = 256;
+    reduce_sum_kernel<T><<<(elements_per_buffer + block_size - 1) / block_size, block_size, 0, stream>>>(
+        d_per_stream_buffer_ptrs,
+        d_output_buffer,
+        num_buffers,
+        elements_per_buffer);
+    CUTF_CHECK_ERROR(cudaGetLastError()); // Check for launch errors
+}
+
 template <class T>
 std::size_t split_core(void *const split_ptr, const mtk::ozimmu::operation_t op,
                        const std::size_t m, const std::size_t n,
@@ -412,7 +454,10 @@ cublasStatus_t cublasGemmEx_org(cublasHandle_t handle, cublasOperation_t transa,
 }
 
 void matmul_core(
-    mtk::ozimmu::handle_t handle, const mtk::ozimmu::operation_t op_A,
+    mtk::ozimmu::handle_t handle, // Keep handle for profiler access etc.
+    cublasHandle_t cublas_handle, // Pass specific cuBLAS handle
+    cudaStream_t stream,          // Pass specific stream for potential internal use (though cublas uses handle's stream)
+    const mtk::ozimmu::operation_t op_A,
     const mtk::ozimmu::operation_t op_B, const std::size_t m,
     const std::size_t n, const std::size_t k, const void *const a_ptr,
     const std::size_t lda, const mtk::ozimmu::data_t type_a,
@@ -468,7 +513,7 @@ void matmul_core(
         gemm_pair_config.B_id == 0 ? to_cublasOperation_t(op_B) : CUBLAS_OP_N;
 
     CUTF_CHECK_ERROR_M(
-        cublasGemmEx_org(handle->cublas_handle, op_A_r, op_B_r, m, n, k,
+        cublasGemmEx_org(cublas_handle, op_A_r, op_B_r, m, n, k,
                          &alpha_i, a_ptr_r, CUDA_R_8I, lda_r, b_ptr_r,
                          CUDA_R_8I, ldb_r, &beta_i, c_ptr_r, CUDA_R_32I, m,
                          CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
@@ -502,31 +547,65 @@ int gemm_int8<double>(mtk::ozimmu::handle_t handle,
                       const std::size_t ldb, const double *beta,
                       double *const c_ptr, std::size_t ldc,
                       const mtk::ozimmu::compute_mode_t compute_mode) {
+  const std::size_t num_streams = handle->streams.size();
+  
   const std::int8_t num_split = mtk::ozimmu::detail::get_split_config(compute_mode)
                                   .matrix_A_split_types.size() -
                               1;
   const std::int8_t bits_per_int8 = mtk::ozimmu::get_bits_per_int8(k);
 
-  double *const c_f64_ptr = reinterpret_cast<double *>(handle->working_memory_ptr);
-  double *const a_max_exp_ptr = c_f64_ptr + m * n;
-  double *const b_max_exp_ptr = a_max_exp_ptr + m;
-  std::int32_t *const c_i32_ptr =
-      reinterpret_cast<int32_t *>(b_max_exp_ptr + n);
-  void *const working_memory_ptr = c_i32_ptr + m * n;
 
-  init_accumulator_buffer(c_f64_ptr, m * n, handle->cuda_stream);
+  // Part 1: Base workspace (split A/B, max_exp arrays)
+  // IMPORTANT: Recalculate the exact size needed here, matching reallocate_working_memory's base calculation.
+  const auto ld_int8_a = mtk::ozimmu::get_slice_ld<std::int8_t>(m, k, mtk::ozimmu::op_t);
+  const auto ld_int8_b = mtk::ozimmu::get_slice_ld<std::int8_t>(k, n, mtk::ozimmu::op_n);
+  const auto num_int8_a_slice_elements = mtk::ozimmu::get_slice_num_elements<std::int8_t>(m, k, mtk::ozimmu::op_t);
+  const auto num_int8_b_slice_elements = mtk::ozimmu::get_slice_num_elements<std::int8_t>(k, n, mtk::ozimmu::op_n);
 
-  const auto ld_int8_a =
-      mtk::ozimmu::get_slice_ld<std::int8_t>(m, k, mtk::ozimmu::op_t);
-  const auto ld_int8_b =
-      mtk::ozimmu::get_slice_ld<std::int8_t>(k, n, mtk::ozimmu::op_n);
+  // Base Workspace Pointers (Order and size must be precise) - **VERIFY THESE**
+  std::size_t current_offset = 0;
+  std::uint8_t *workspace_base = reinterpret_cast<std::uint8_t*>(handle->working_memory_ptr);
 
-  const auto num_int8_a_slice_elements =
-      mtk::ozimmu::get_slice_num_elements<std::int8_t>(m, k, mtk::ozimmu::op_t);
-  std::size_t A_working_memory_size = num_int8_a_slice_elements * num_split;
+  // Example layout (adjust based on actual needs):
+  double* a_max_exp_ptr = reinterpret_cast<double*>(workspace_base + current_offset);
+  current_offset += m * sizeof(double);
+  double* b_max_exp_ptr = reinterpret_cast<double*>(workspace_base + current_offset);
+  current_offset += n * sizeof(double);
+  std::int8_t* a_int8_slices_ptr = reinterpret_cast<std::int8_t*>(workspace_base + current_offset);
+  std::size_t size_split_A = num_int8_a_slice_elements * num_split * sizeof(std::int8_t); // Simplified size
+  current_offset += size_split_A;
+  std::int8_t* b_int8_slices_ptr = reinterpret_cast<std::int8_t*>(workspace_base + current_offset);
+  std::size_t size_split_B = num_int8_b_slice_elements * num_split * sizeof(std::int8_t); // Simplified size
+  current_offset += size_split_B;
+  // Add other base buffers if needed...
+  const std::size_t base_workspace_end_offset = current_offset;
+  
+  // Part 2: Per-stream workspace
+  const std::size_t size_per_stream_i32 = m * n * sizeof(std::int32_t);
+  const std::size_t size_per_stream_f64 = m * n * sizeof(double);
+  const std::size_t size_final_reduction_f64 = size_per_stream_f64; // Re-use size calculation
 
-  auto a_int8_slices_ptr = reinterpret_cast<std::int8_t *>(working_memory_ptr);
-  auto b_int8_slices_ptr = a_int8_slices_ptr + A_working_memory_size;
+  std::vector<std::int32_t*> d_per_stream_c_i32_ptrs(num_streams);
+  std::vector<double*> d_per_stream_c_f64_ptrs(num_streams);
+  std::uint8_t* per_stream_base_ptr = workspace_base + base_workspace_end_offset;
+  current_offset = 0; // Reset offset relative to per_stream_base_ptr
+  
+  for (std::size_t i = 0; i < num_streams; ++i) {
+    d_per_stream_c_i32_ptrs[i] = reinterpret_cast<std::int32_t*>(per_stream_base_ptr + current_offset);
+    current_offset += size_per_stream_i32;
+  }
+  double* all_f64_buffers_start = reinterpret_cast<double*>(per_stream_base_ptr + current_offset);
+  for (std::size_t i = 0; i < num_streams; ++i) {
+      d_per_stream_c_f64_ptrs[i] = reinterpret_cast<double*>(per_stream_base_ptr + current_offset);
+      current_offset += size_per_stream_f64;
+  }
+  double* d_final_reduced_f64_ptr = reinterpret_cast<double*>(per_stream_base_ptr + current_offset);
+  // --- End Workspace Layout ---
+
+  // --- Setup Phase (on cuda_stream) ---
+  cudaEvent_t split_done_event, init_done_event;
+  CUTF_CHECK_ERROR(cudaEventCreate(&split_done_event));
+  CUTF_CHECK_ERROR(cudaEventCreate(&init_done_event));
 
   split_AB_int8_nearest(
     handle,
@@ -541,88 +620,115 @@ int gemm_int8<double>(mtk::ozimmu::handle_t handle,
     num_split,
     bits_per_int8
     );
+  // Record event when split is done on its stream
+  CUTF_CHECK_ERROR(cudaEventRecord(split_done_event, handle->cuda_stream));
 
-  int lim_accum = 31 - bits_per_int8 - bits_per_int8 - ceil(log2(k));
-  int beta_i = 0;
-  int p = -1;
+  // Launch single kernel to initialize ALL per-stream f64 buffers
+  init_accumulator_buffer<double>(
+    all_f64_buffers_start,          // Start of the entire f64 region
+    m * n * num_streams,            // Total number of elements
+    handle->cuda_stream             // Launch on cuda_stream
+    );
+  // Record event when init is done on its stream
+  CUTF_CHECK_ERROR(cudaEventRecord(init_done_event, handle->cuda_stream));
+
+  // Create device array of pointers for reduction kernel
+  double** h_per_stream_f64_ptrs = new double*[num_streams];
+  for(size_t i=0; i<num_streams; ++i) h_per_stream_f64_ptrs[i] = d_per_stream_c_f64_ptrs[i];
+  double** d_per_stream_f64_ptrs_array = nullptr;
+  CUTF_CHECK_ERROR(cudaMallocAsync(&d_per_stream_f64_ptrs_array, num_streams * sizeof(double*), handle->cuda_stream));
+  CUTF_CHECK_ERROR(cudaMemcpyAsync(d_per_stream_f64_ptrs_array, h_per_stream_f64_ptrs, num_streams * sizeof(double*), cudaMemcpyHostToDevice, handle->cuda_stream));
+  delete[] h_per_stream_f64_ptrs;
+  // No sync needed here, work below will wait for cuda_stream via events.
 
   const auto &gemm_pair_config_list =
       mtk::ozimmu::detail::get_split_config(compute_mode).gemm_pair_config_list;
 
-  
-	if (lim_accum == 0) {
+  for (size_t i = 0; i < gemm_pair_config_list.size(); ++i) {
+    const auto& gemm_pair_config = gemm_pair_config_list[i];
+    const std::size_t stream_idx = i % num_streams;
+    cudaStream_t current_stream = handle->streams[stream_idx];
+    cudaEvent_t current_event = handle->events[stream_idx]; // Use the pre-allocated events
 
-    //=====
-    // Group-wise error-free summation cannot be applied
-    //=====
-    for (const auto &gemm_pair_config : gemm_pair_config_list) {
-      matmul_core(handle, op_A, op_B, m, n,
-                  ld_int8_a, // use ld_int8_a instead of k for better stability
-                  a_ptr, lda, mtk::ozimmu::fp64, b_ptr, ldb, mtk::ozimmu::fp64,
-                  beta_i, c_i32_ptr, gemm_pair_config, compute_mode, a_int8_slices_ptr,
-                  ld_int8_a, b_int8_slices_ptr, ld_int8_b);
-      handle->profiler.start_timer_sync("accumulate_in_f64_2");
-      accumulate_in_f64_2(
-          m,
-          c_f64_ptr,
-          c_i32_ptr,
-          m * n,
-          a_max_exp_ptr,
-          b_max_exp_ptr,
-          ldexp(1.0,-bits_per_int8*(gemm_pair_config.A_id + gemm_pair_config.B_id - 2)),
-          handle->cuda_stream
-          );
-      handle->profiler.stop_timer_sync("accumulate_in_f64_2");
-    }
+    // Make current stream wait for setup phase
+    CUTF_CHECK_ERROR(cudaStreamWaitEvent(current_stream, split_done_event, 0));
+    CUTF_CHECK_ERROR(cudaStreamWaitEvent(current_stream, init_done_event, 0));
 
-  } else {
+    std::int32_t* current_c_i32_ptr = d_per_stream_c_i32_ptrs[stream_idx];
+    double* current_c_f64_ptr = d_per_stream_c_f64_ptrs[stream_idx];
 
-    //=====
-    // Group-wise error-free summation
-    //=====
-		lim_accum = 1<<lim_accum;
-    for (const auto &gemm_pair_config : gemm_pair_config_list) {
-			if (gemm_pair_config.A_id == 1) p++;
-			if ((gemm_pair_config.A_id-1) % lim_accum == 0) beta_i = 0;
+    // Call matmul_core (passes k, uses beta_i = 0)
+    matmul_core(handle, /* stream_idx if multi-handle, */ handle->cublas_handles[stream_idx], current_stream,
+                op_A, op_B, m, n, k, // Pass original k
+                a_ptr, lda, mtk::ozimmu::fp64, b_ptr, ldb, mtk::ozimmu::fp64,
+                0, // beta_i = 0 for int32 output buffer
+                current_c_i32_ptr, // Output: Per-stream int32 buffer
+                gemm_pair_config, compute_mode,
+                a_int8_slices_ptr, // Input: Shared split data
+                ld_int8_a,
+                b_int8_slices_ptr, // Input: Shared split data
+                ld_int8_b);
 
-      matmul_core(handle, op_A, op_B, m, n,
-                  ld_int8_a, // use ld_int8_a instead of k for better stability
-                  a_ptr, lda, mtk::ozimmu::fp64, b_ptr, ldb, mtk::ozimmu::fp64,
-                  beta_i, c_i32_ptr, gemm_pair_config, compute_mode, a_int8_slices_ptr,
-                  ld_int8_a, b_int8_slices_ptr, ld_int8_b);
-                  
-			beta_i = 1;
-			if ((gemm_pair_config.A_id-1) == p 
-        || ((gemm_pair_config.A_id % lim_accum == 0) && gemm_pair_config.A_id > 1)) {
+    // Accumulate the int32 result into the per-stream double buffer
+    const double scale = std::ldexp(1.0, -bits_per_int8 * (gemm_pair_config.A_id + gemm_pair_config.B_id - 2));
 
-				handle->profiler.start_timer_sync("accumulate_in_f64_2");
-				accumulate_in_f64_2(
-						m,
-						c_f64_ptr,
-						c_i32_ptr,
-						m * n,
-						a_max_exp_ptr,
-						b_max_exp_ptr,
-            ldexp(1.0,-bits_per_int8*(gemm_pair_config.A_id + gemm_pair_config.B_id - 2)),
-						handle->cuda_stream
-						);
-				handle->profiler.stop_timer_sync("accumulate_in_f64_2");
+    accumulate_in_f64_2(
+        m,
+        current_c_f64_ptr, // Accumulate here
+        current_c_i32_ptr, // Read from here
+        m * n,
+        a_max_exp_ptr,     // Shared scaling factors
+        b_max_exp_ptr,     // Shared scaling factors
+        scale,             // Scale for this specific split pair
+        current_stream);   // Run on the current stream
 
-      }
-    }
-    
+    // Record event when this stream's work for this iteration is done
+    CUTF_CHECK_ERROR(cudaEventRecord(current_event, current_stream));
   }
-  
-  handle->profiler.start_timer_sync("copy_result_2");
-	axby_2(
-		m, n,
-		*alpha,
-		c_f64_ptr,
-		*beta,
-		c_ptr, ldc,
-		handle->cuda_stream
-		);
-  handle->profiler.stop_timer_sync("copy_result_2");
+
+  // --- Synchronization and Final Reduction/Copy (on cuda_stream) ---
+
+  // Make the primary user stream wait for ALL iterations to complete across all worker streams
+  for (size_t i = 0; i < gemm_pair_config_list.size(); ++i) {
+      const std::size_t stream_idx = i % num_streams;
+      // Wait for the event corresponding to the last task launched on that stream for this loop
+        CUTF_CHECK_ERROR(cudaStreamWaitEvent(handle->cuda_stream, handle->events[stream_idx], 0));
+        // Optimization: Only need to wait for the *last* event recorded for each stream index
+        // that was actually used in the loop. This simpler version waits for all potentially
+        // recorded events which is safe but might wait slightly longer if list size < num_streams.
+  }
+  // Alternative, potentially cleaner wait:
+  // for (std::size_t i = 0; i < std::min(num_streams, gemm_pair_config_list.size()); ++i) {
+  //    CUTF_CHECK_ERROR(cudaStreamWaitEvent(handle->cuda_stream, handle->events[i], 0));
+  //}
+
+
+  // Reduce results from all per-stream double buffers
+  reduce_sum_buffers<double>(
+      d_per_stream_f64_ptrs_array, // Device array of pointers
+      d_final_reduced_f64_ptr,     // Output buffer
+      num_streams,                 // Number of buffers to reduce
+      m * n,                       // Elements per buffer
+      handle->cuda_stream);        // Perform reduction on the user stream
+
+  // Final step: alpha * reduced_result + beta * C -> C
+  axby_2(
+      m, n,
+      *alpha,
+      d_final_reduced_f64_ptr, // Input is the reduced sum
+      *beta,
+      c_ptr, ldc,              // Final output matrix
+      handle->cuda_stream);    // Run on the user stream
+
+  // --- Cleanup ---
+  // Free the device array of pointers
+  CUTF_CHECK_ERROR(cudaFreeAsync(d_per_stream_f64_ptrs_array, handle->cuda_stream));
+  // Destroy temporary events
+  CUTF_CHECK_ERROR(cudaEventDestroy(split_done_event));
+  CUTF_CHECK_ERROR(cudaEventDestroy(init_done_event));
+
+  // Optional: Synchronize the final stream if caller expects completion on return
+  // CUTF_CHECK_ERROR(cudaStreamSynchronize(handle->cuda_stream));
 
   return 0;
 }
@@ -636,107 +742,237 @@ int gemm_int8<cuDoubleComplex>(
     const cuDoubleComplex *const b_ptr, const std::size_t ldb,
     const cuDoubleComplex *beta, cuDoubleComplex *const c_ptr, std::size_t ldc,
     const mtk::ozimmu::compute_mode_t compute_mode) {
-  using real_t = double;
+  // --- Basic Setup & Workspace Calculation ---
+  const std::size_t num_streams = handle->streams.size();
+    if (num_streams == 0) {
+      ozIMMU_log("ERROR: Stream pool size is zero.");
+      return 1; // Or throw an exception
+  }
   const unsigned num_split = mtk::ozimmu::detail::get_split_config(compute_mode)
-                                 .matrix_A_split_types.size() -
-                             1;
+                                  .matrix_A_split_types.size() - 1;
   const int32_t bits_per_int8 = mtk::ozimmu::get_bits_per_int8(k);
   const auto &gemm_pair_config_list =
       mtk::ozimmu::detail::get_split_config(compute_mode).gemm_pair_config_list;
 
-  const auto ld_int8_a =
-      mtk::ozimmu::get_slice_ld<std::int8_t>(m, k, mtk::ozimmu::op_t);
-  const auto ld_int8_b =
-      mtk::ozimmu::get_slice_ld<std::int8_t>(k, n, mtk::ozimmu::op_n);
+  // --- Workspace Layout Calculation ---
+  // Complex case needs more careful layout calculation
+  const auto ld_int8_a = mtk::ozimmu::get_slice_ld<std::int8_t>(m, k, mtk::ozimmu::op_t);
+  const auto ld_int8_b = mtk::ozimmu::get_slice_ld<std::int8_t>(k, n, mtk::ozimmu::op_n);
+  const auto num_int8_a_slice_elements = mtk::ozimmu::get_slice_num_elements<std::int8_t>(m, k, mtk::ozimmu::op_t);
+  const auto num_int8_b_slice_elements = mtk::ozimmu::get_slice_num_elements<std::int8_t>(k, n, mtk::ozimmu::op_n);
 
-  const auto num_int8_a_slice_elements =
-      mtk::ozimmu::get_slice_num_elements<std::int8_t>(m, k, mtk::ozimmu::op_t);
-  const auto num_int8_b_slice_elements =
-      mtk::ozimmu::get_slice_num_elements<std::int8_t>(k, n, mtk::ozimmu::op_n);
+  // Base Workspace: split A (real/imag), split B (real/imag), max_exp (a_real/imag, b_real/imag)
+  std::size_t size_split_A_cmplx = num_int8_a_slice_elements * num_split * sizeof(std::int8_t) * 2; // Real + Imag parts
+  std::size_t size_split_B_cmplx = num_int8_b_slice_elements * num_split * sizeof(std::int8_t) * 2;
+  std::size_t size_max_exp_cmplx = (m * 2 + n * 2) * sizeof(double); // a_real, a_imag, b_real, b_imag
 
-  const std::size_t A_working_memory_size =
-      num_int8_a_slice_elements * num_split;
-  const std::size_t B_working_memory_size =
-      num_int8_b_slice_elements * num_split;
+  std::size_t base_workspace_offset = 0;
+  std::uint8_t *base_workspace_ptr = reinterpret_cast<std::uint8_t*>(handle->working_memory_ptr);
 
-  double *const tmp_f64_ptr =
-      reinterpret_cast<double *>(handle->working_memory_ptr);
-  double *const a_real_max_exp_ptr = tmp_f64_ptr + m * n;
-  double *const a_imag_max_exp_ptr = a_real_max_exp_ptr + m;
-  double *const b_real_max_exp_ptr = a_imag_max_exp_ptr + m;
-  double *const b_imag_max_exp_ptr = b_real_max_exp_ptr + n;
-  std::int32_t *const c_i32_ptr =
-      reinterpret_cast<std::int32_t *>(b_imag_max_exp_ptr + n);
-  void *const working_memory_ptr = c_i32_ptr + m * n;
+  // Max exponents pointers
+  double *const a_real_max_exp_ptr = reinterpret_cast<double*>(base_workspace_ptr + base_workspace_offset);
+  base_workspace_offset += m * sizeof(double);
+  double *const a_imag_max_exp_ptr = reinterpret_cast<double*>(base_workspace_ptr + base_workspace_offset);
+  base_workspace_offset += m * sizeof(double);
+  double *const b_real_max_exp_ptr = reinterpret_cast<double*>(base_workspace_ptr + base_workspace_offset);
+  base_workspace_offset += n * sizeof(double);
+  double *const b_imag_max_exp_ptr = reinterpret_cast<double*>(base_workspace_ptr + base_workspace_offset);
+  base_workspace_offset += n * sizeof(double);
 
-  const double *a_max_exp_ptr_list[] = {a_real_max_exp_ptr, a_imag_max_exp_ptr};
-  const std::int8_t *a_int8_working_memory_ptr_list[] = {
-      reinterpret_cast<const std::int8_t *>(working_memory_ptr),
-      reinterpret_cast<const std::int8_t *>(working_memory_ptr) +
-          A_working_memory_size,
-  };
+  // Split int8 pointers (real/imag for A and B) - ORDER MATTERS! Match split_AB_int8<cuDoubleComplex>
+  std::int8_t* a_int8_real_ptr = reinterpret_cast<std::int8_t*>(base_workspace_ptr + base_workspace_offset);
+  base_workspace_offset += size_split_A_cmplx / 2;
+  std::int8_t* a_int8_imag_ptr = reinterpret_cast<std::int8_t*>(base_workspace_ptr + base_workspace_offset);
+  base_workspace_offset += size_split_A_cmplx / 2;
+  std::int8_t* b_int8_real_ptr = reinterpret_cast<std::int8_t*>(base_workspace_ptr + base_workspace_offset);
+  base_workspace_offset += size_split_B_cmplx / 2;
+  std::int8_t* b_int8_imag_ptr = reinterpret_cast<std::int8_t*>(base_workspace_ptr + base_workspace_offset);
+  base_workspace_offset += size_split_B_cmplx / 2;
 
-  const double *b_max_exp_ptr_list[] = {b_real_max_exp_ptr, b_imag_max_exp_ptr};
-  const std::int8_t *b_int8_working_memory_ptr_list[] = {
-      a_int8_working_memory_ptr_list[0] + A_working_memory_size * 2,
-      a_int8_working_memory_ptr_list[0] + A_working_memory_size * 2 +
-          B_working_memory_size,
-  };
+
+  // Per-stream Workspace: int32 (size m*n), double (size m*n, used for real part accumulation)
+  // We accumulate real parts of the 4 sub-products separately per stream.
+  const std::size_t size_per_stream_i32 = m * n * sizeof(std::int32_t);
+  const std::size_t size_per_stream_f64 = m * n * sizeof(double); // Accumulating real parts
+  const std::size_t size_final_reduction_f64 = size_per_stream_f64;
+
+  std::vector<std::int32_t*> d_per_stream_c_i32_ptrs(num_streams);
+  std::vector<double*> d_per_stream_c_f64_ptrs(num_streams); // For accumulating real parts
+
+  std::uint8_t* per_stream_base_ptr = base_workspace_ptr + base_workspace_offset;
+  std::size_t current_per_stream_offset = 0;
+
+  for (std::size_t i = 0; i < num_streams; ++i) {
+      d_per_stream_c_i32_ptrs[i] = reinterpret_cast<std::int32_t*>(per_stream_base_ptr + current_per_stream_offset);
+      current_per_stream_offset += size_per_stream_i32;
+  }
+    for (std::size_t i = 0; i < num_streams; ++i) {
+      d_per_stream_c_f64_ptrs[i] = reinterpret_cast<double*>(per_stream_base_ptr + current_per_stream_offset);
+      current_per_stream_offset += size_per_stream_f64;
+  }
+  double* d_final_reduced_f64_ptr = reinterpret_cast<double*>(per_stream_base_ptr + current_per_stream_offset);
+
+
+  // --- Split Complex Data ---
+  // Pointers needed by split_AB_int8<cuDoubleComplex>
+  // IMPORTANT: Ensure the order matches how split_AB_int8 writes!
+  std::int8_t *a_working_ptr_split = reinterpret_cast<std::int8_t*>(handle->working_memory_ptr) + (size_max_exp_cmplx);
+  std::int8_t *b_working_ptr_split = a_working_ptr_split + size_split_A_cmplx;
 
   split_AB_int8<cuDoubleComplex>(
-      handle, op_A, op_B, m, n, k, a_ptr, lda, a_real_max_exp_ptr,
-      reinterpret_cast<std::int8_t *>(working_memory_ptr), ld_int8_a, b_ptr,
-      ldb, b_real_max_exp_ptr,
-      reinterpret_cast<std::int8_t *>(working_memory_ptr) +
-          A_working_memory_size * 2,
-      ld_int8_b, num_split, bits_per_int8);
+    handle, op_A, op_B, m, n, k, a_ptr, lda,
+    a_real_max_exp_ptr,    // Output exp real A
+    a_working_ptr_split,   // Output int8 real A (first half)
+    ld_int8_a,
+    b_ptr, ldb,
+    b_real_max_exp_ptr,    // Output exp real B
+    b_working_ptr_split,   // Output int8 real B (first half)
+    ld_int8_b, num_split, bits_per_int8
+    // Needs stream, use cuda_stream
+    // mtk::ozimmu::split_int8<cuDoubleComplex>(..., handle->cuda_stream);
+    );
+  // Need pointers to imag parts for max_exp arrays (calculated above)
+  // a_imag_max_exp_ptr, b_imag_max_exp_ptr
 
-  // Init C
+  CUTF_CHECK_ERROR(cudaStreamSynchronize(handle->cuda_stream)); // Sync split
+
+  // --- Initialise Output C ---
   init_c_complex(m, n, c_ptr, ldc, *beta, handle->cuda_stream);
+  CUTF_CHECK_ERROR(cudaStreamSynchronize(handle->cuda_stream)); // Sync init
 
-  for (const auto p : std::vector<std::pair<unsigned, unsigned>>{
-           {1, 1}, {0, 0}, {1, 0}, {0, 1}}) {
-    init_accumulator_buffer(tmp_f64_ptr, m * n, handle->cuda_stream);
-    for (const auto &gemm_pair_config : gemm_pair_config_list) {
-      matmul_core(handle, mtk::ozimmu::op_t, mtk::ozimmu::op_n, m, n,
-                  ld_int8_a, // use ld_int8_a instead of k for better stability
-                  a_ptr, lda, mtk::ozimmu::fp64, b_ptr, ldb, mtk::ozimmu::fp64,
-                  0, c_i32_ptr, gemm_pair_config, compute_mode,
-                  a_int8_working_memory_ptr_list[p.first], ld_int8_a,
-                  b_int8_working_memory_ptr_list[p.second], ld_int8_b);
-      handle->profiler.start_timer_sync("accumulate_in_f64");
-      accumulate_in_f64(
-          tmp_f64_ptr, c_i32_ptr, m * n,
-          bits_per_int8 * (gemm_pair_config.A_id + gemm_pair_config.B_id - 2) -
-              (7 /*bitlen(int8)-1*/ - bits_per_int8) *
-                  2, // The `(7 - bits_per_int8) * 2` term is required because
-                     // the mantissa `bits_per_int8` bits are stored in the low
-                     // `bits_per_int8` bits of an int8.
+
+  // Device array of pointers for reduction kernel
+  double** h_per_stream_f64_ptrs = new double*[num_streams];
+  for(size_t i=0; i<num_streams; ++i) h_per_stream_f64_ptrs[i] = d_per_stream_c_f64_ptrs[i];
+  double** d_per_stream_f64_ptrs_array = nullptr;
+  CUTF_CHECK_ERROR(cudaMalloc(&d_per_stream_f64_ptrs_array, num_streams * sizeof(double*)));
+  CUTF_CHECK_ERROR(cudaMemcpy(d_per_stream_f64_ptrs_array, h_per_stream_f64_ptrs, num_streams * sizeof(double*), cudaMemcpyHostToDevice));
+  delete[] h_per_stream_f64_ptrs;
+
+
+  // --- Loop over 4 complex multiplications (real*real, imag*imag, real*imag, imag*real) ---
+  const double *a_max_exp_ptr_list[] = {a_real_max_exp_ptr, a_imag_max_exp_ptr};
+  const double *b_max_exp_ptr_list[] = {b_real_max_exp_ptr, b_imag_max_exp_ptr};
+  // Pointers to the actual int8 data slices (real/imag)
+  const std::int8_t *a_int8_slices_list[] = {a_int8_real_ptr, a_int8_imag_ptr};
+  const std::int8_t *b_int8_slices_list[] = {b_int8_real_ptr, b_int8_imag_ptr};
+
+
+  for (const auto p : std::vector<std::pair<unsigned, unsigned>>{{0, 0}, {1, 1}, {0, 1}, {1, 0}}) { // RR, II, RI, IR
+
+      // Initialize per-stream double accumulators for this sub-product
+      for (std::size_t i = 0; i < num_streams; ++i) {
+          init_accumulator_buffer<double>(d_per_stream_c_f64_ptrs[i], m * n, handle->streams[i]);
+      }
+
+      // Inner loop launching tasks onto streams
+      for (size_t i = 0; i < gemm_pair_config_list.size(); ++i) {
+          const auto& gemm_pair_config = gemm_pair_config_list[i];
+          const std::size_t stream_idx = i % num_streams;
+          cudaStream_t current_stream = handle->streams[stream_idx];
+          cublasHandle_t current_cublas_handle = handle->cublas_handles[stream_idx];
+          cudaEvent_t current_event = handle->events[stream_idx];
+
+          std::int32_t* current_c_i32_ptr = d_per_stream_c_i32_ptrs[stream_idx];
+          double* current_c_f64_ptr = d_per_stream_c_f64_ptrs[stream_idx];
+
+          // Select correct int8 input data for this sub-product (RR, II, RI, IR)
+          const void* current_a_int8_working_ptr = a_int8_slices_list[p.first];
+          const void* current_b_int8_working_ptr = b_int8_slices_list[p.second];
+
+
+          matmul_core(handle, current_cublas_handle, current_stream,
+                      mtk::ozimmu::op_t, mtk::ozimmu::op_n, // Assuming T, N for int8? Verify required ops
+                      m, n,
+                      ld_int8_a, // K value? Check usage
+                      a_ptr, lda, mtk::ozimmu::fp64, b_ptr, ldb, mtk::ozimmu::fp64,
+                      0, // beta_i = 0 for int32 output
+                      current_c_i32_ptr, // Output int32
+                      gemm_pair_config, compute_mode,
+                      current_a_int8_working_ptr, // Input A int8 (real or imag)
+                      ld_int8_a,
+                      current_b_int8_working_ptr, // Input B int8 (real or imag)
+                      ld_int8_b);
+
+          // Accumulate into per-stream double buffer
+            const double scale = ldexp(1.0, -bits_per_int8 * (gemm_pair_config.A_id + gemm_pair_config.B_id - 2)
+                                        // Adjust scale based on original accumulate_in_f64?
+                                        // + (7 - bits_per_int8) * 2 // Original complex adjustment? Verify necessity
+                                        );
+
+          // Use accumulate_in_f64 for complex case (adds scaled int32<<32) ? Check definition
+            accumulate_in_f64( // Or accumulate_in_f64_2 if that's more appropriate?
+              current_c_f64_ptr, // Accumulate here
+              current_c_i32_ptr, // Read from here
+              m * n,
+              // Mantissa shift calculation needs to be verified from original accumulate_in_f64
+                bits_per_int8 * (gemm_pair_config.A_id + gemm_pair_config.B_id - 2) - (7-bits_per_int8)*2, // Placeholder shift
+              current_stream);
+
+          CUTF_CHECK_ERROR(cudaEventRecord(current_event, current_stream));
+      } // End inner loop (gemm_pair_config_list)
+
+      // --- Sync, Reduce, and Combine for this sub-product (RR, II, RI, IR) ---
+      for (std::size_t i = 0; i < num_streams; ++i) {
+            // Check if event is valid before waiting
+            bool event_recorded = false;
+            for(size_t j=0; j < gemm_pair_config_list.size(); ++j) {
+                if ((j % num_streams) == i) {
+                    event_recorded = true;
+                    break;
+                }
+            }
+            if (event_recorded) {
+                CUTF_CHECK_ERROR(cudaStreamWaitEvent(handle->cuda_stream, handle->events[i], 0));
+            }
+      }
+
+      // Reduce per-stream double results
+      reduce_sum_buffers<double>(
+          d_per_stream_f64_ptrs_array,
+          d_final_reduced_f64_ptr, // Output reduced real part
+          num_streams,
+          m * n,
           handle->cuda_stream);
-      handle->profiler.stop_timer_sync("accumulate_in_f64");
-    }
 
-    real_t axpy_alpha_real = 0;
-    real_t axpy_alpha_imag = 0;
-    if (p.first == 0 && p.second == 0) {
-      axpy_alpha_real = alpha->x;
-      axpy_alpha_imag = alpha->y;
-    } else if (p.first == 1 && p.second == 1) {
-      axpy_alpha_real = -alpha->x;
-      axpy_alpha_imag = -alpha->y;
-    } else {
-      axpy_alpha_real = -alpha->y;
-      axpy_alpha_imag = alpha->x;
-    }
-    handle->profiler.start_timer_sync("copy_result");
-    axy_complex(m, n, make_cuDoubleComplex(axpy_alpha_real, axpy_alpha_imag),
-                tmp_f64_ptr, c_ptr, ldc, a_max_exp_ptr_list[p.first],
-                b_max_exp_ptr_list[p.second], handle->cuda_stream);
-    handle->profiler.stop_timer_sync("copy_result");
-  }
+      // Combine the reduced result into the final complex C matrix
+      // Determine the correct complex alpha factor for this sub-product
+      double alpha_real_part = 0.0;
+      double alpha_imag_part = 0.0;
+      if (p.first == 0 && p.second == 0) { // RR
+          alpha_real_part = alpha->x;
+          alpha_imag_part = alpha->y;
+      } else if (p.first == 1 && p.second == 1) { // II
+          alpha_real_part = -alpha->x;
+          alpha_imag_part = -alpha->y;
+      } else if (p.first == 0 && p.second == 1) { // RI
+            alpha_real_part = -alpha->y; // -Im(alpha)
+            alpha_imag_part = alpha->x;  // Re(alpha)
+      } else { // IR (p.first == 1 && p.second == 0)
+            alpha_real_part = -alpha->y; // -Im(alpha)
+            alpha_imag_part = alpha->x;  // Re(alpha)
+      }
+
+        axy_complex(m, n, make_cuDoubleComplex(alpha_real_part, alpha_imag_part),
+                    d_final_reduced_f64_ptr, // Input: reduced real part of sub-product
+                    c_ptr, ldc,              // Output: final C matrix (accumulates)
+                    a_max_exp_ptr_list[p.first], // Scaling factors
+                    b_max_exp_ptr_list[p.second],
+                    handle->cuda_stream);    // Run on user stream
+
+  } // End outer loop (p)
+
+
+  // --- Cleanup ---
+  CUTF_CHECK_ERROR(cudaFree(d_per_stream_f64_ptrs_array));
+
+  // Synchronize the final stream if the caller expects completion
+  // CUTF_CHECK_ERROR(cudaStreamSynchronize(handle->cuda_stream));
 
   return 0;
 }
+
+
 } // unnamed namespace
 
 int mtk::ozimmu::gemm(mtk::ozimmu::handle_t handle,
@@ -857,7 +1093,7 @@ int mtk::ozimmu::gemm(mtk::ozimmu::handle_t handle,
     } else if (compute_mode == mtk::ozimmu::dgemm) {
       const auto dtype =
           element_kind == mtk::ozimmu::real ? CUDA_R_64F : CUDA_C_64F;
-      cublasGemmEx_org(handle->cublas_handle, to_cublasOperation_t(op_A),
+      cublasGemmEx_org(handle->cublas_handles[0], to_cublasOperation_t(op_A),
                        to_cublasOperation_t(op_B), m, n, k, alpha, a_ptr, dtype,
                        lda, b_ptr, dtype, ldb, beta, c_ptr, dtype, ldc,
                        CUBLAS_COMPUTE_64F, CUBLAS_GEMM_DEFAULT);

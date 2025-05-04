@@ -2,11 +2,21 @@
 #include <cutf/cublas.hpp>
 #include <cutf/debug/time_breakdown.hpp>
 #include <ozimmu/ozimmu.hpp>
+#include <vector> 
+#include <cuda_runtime.h> 
 
 struct mtk::ozimmu::handle {
   // handlers
-  cublasHandle_t cublas_handle;
-  cudaStream_t cuda_stream;
+  // cublasHandle_t cublas_handle;
+  // cudaStream_t cuda_stream;
+
+  // Stream and Event Pools for parallel execution
+  std::vector<cudaStream_t> streams;
+  std::vector<cudaEvent_t> events;
+  std::vector<cublasHandle_t> cublas_handles; 
+
+  // Main stream set by user (or default 0)
+  cudaStream_t cuda_stream = 0; 
 
   // working memory
   void *working_memory_ptr;

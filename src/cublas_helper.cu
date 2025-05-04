@@ -116,13 +116,13 @@ cublasStatus_t mtk::ozimmu::dgemm_f32(
   if constexpr (std::is_same_v<double, T>) {
     const auto alpha_f32 = static_cast<float>(alpha);
     const auto beta_f32 = static_cast<float>(beta);
-    sgemm_status = cublasSgemm(handle->cublas_handle, op_A, op_B, m, n, k,
+    sgemm_status = cublasSgemm(handle->cublas_handles[0], op_A, op_B, m, n, k,
                                &alpha_f32, A_f32_ptr, ld_f32_A, B_f32_ptr,
                                ld_f32_B, &beta_f32, C_f32_ptr, m);
   } else {
     const auto alpha_f32 = make_cuComplex(alpha.x, alpha.y);
     const auto beta_f32 = make_cuComplex(beta.x, beta.y);
-    sgemm_status = cublasCgemm(handle->cublas_handle, op_A, op_B, m, n, k,
+    sgemm_status = cublasCgemm(handle->cublas_handles[0], op_A, op_B, m, n, k,
                                &alpha_f32, A_f32_ptr, ld_f32_A, B_f32_ptr,
                                ld_f32_B, &beta_f32, C_f32_ptr, m);
   }
@@ -184,14 +184,14 @@ cublasStatus_t mtk::ozimmu::dgemm_f32_batched(
     const auto alpha_f32 = static_cast<float>(alpha);
     const auto beta_f32 = static_cast<float>(beta);
     sgemm_status = cublasSgemmStridedBatched(
-        handle->cublas_handle, op_A, op_B, m, n, k, &alpha_f32, A_f32_ptr,
+        handle->cublas_handles[0], op_A, op_B, m, n, k, &alpha_f32, A_f32_ptr,
         ld_f32_A, m * k, B_f32_ptr, ld_f32_B, n * k, &beta_f32, C_f32_ptr, m,
         m * n, batch_size);
   } else {
     const auto alpha_f32 = make_cuComplex(alpha.x, alpha.y);
     const auto beta_f32 = make_cuComplex(beta.x, beta.y);
     sgemm_status = cublasCgemmStridedBatched(
-        handle->cublas_handle, op_A, op_B, m, n, k, &alpha_f32, A_f32_ptr,
+        handle->cublas_handles[0], op_A, op_B, m, n, k, &alpha_f32, A_f32_ptr,
         ld_f32_A, m * k, B_f32_ptr, ld_f32_B, n * k, &beta_f32, C_f32_ptr, m,
         m * n, batch_size);
   }

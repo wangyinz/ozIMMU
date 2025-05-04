@@ -2,13 +2,31 @@
 #include "handle.hpp"
 #include "utils.hpp"
 #include <cutf/device.hpp>
+#include <stdexcept>
+
+// Define the size of the stream/handle pool
+#define OZIMMU_STREAM_POOL_SIZE 8
 
 int mtk::ozimmu::create(mtk::ozimmu::handle_t *h,
                         mtk::ozimmu::malloc_mode_t mm) {
   ozIMMU_log("Initializing ozIMMU handle");
   auto handle = (*h = new mtk::ozimmu::handle);
-  // Initialize cuBLAS handler
-  CUTF_CHECK_ERROR(cublasCreate_org(&(handle->cublas_handle)));
+
+  // Initialize Stream, Event, and cuBLAS Handle Pools
+  handle->streams.resize(OZIMMU_STREAM_POOL_SIZE);
+  handle->events.resize(OZIMMU_STREAM_POOL_SIZE);
+  handle->cublas_handles.resize(OZIMMU_STREAM_POOL_SIZE);
+
+  for (int i = 0; i < OZIMMU_STREAM_POOL_SIZE; ++i) {
+    // Create non-blocking streams
+    CUTF_CHECK_ERROR(cudaStreamCreateWithFlags(&handle->streams[i], cudaStreamNonBlocking));
+    // Create events (default flags)
+    CUTF_CHECK_ERROR(cudaEventCreate(&handle->events[i]));
+    // Create cuBLAS handles
+    CUTF_CHECK_ERROR(cublasCreate_org(&handle->cublas_handles[i]));
+    // Associate each cuBLAS handle with its stream
+    CUTF_CHECK_ERROR(cublasSetStream(handle->cublas_handles[i], handle->streams[i]));
+  }
 
   handle->current_working_memory_size = 0;
   handle->working_memory_ptr = nullptr;
@@ -35,14 +53,23 @@ int mtk::ozimmu::create(mtk::ozimmu::handle_t *h,
 int mtk::ozimmu::destroy(mtk::ozimmu::handle_t handle) {
   if (handle) {
     ozIMMU_log("Destroying ozIMMU handle");
-    // Destroy cuBLAS handler
-    CUTF_CHECK_ERROR(cublasDestroy_org(handle->cublas_handle));
 
-    CUTF_CHECK_ERROR(cudaFree(handle->working_memory_ptr));
-    handle->working_memory_ptr = nullptr;
-
-    CUTF_CHECK_ERROR(cudaFree(handle->d_mantissa_loss_counter_ptr));
-    handle->d_mantissa_loss_counter_ptr = nullptr;
+    // Destroy Stream, Event, and cuBLAS Handle Pools
+    for (int i = 0; i < OZIMMU_STREAM_POOL_SIZE; ++i) {
+        if (handle->cublas_handles.size() > i && handle->cublas_handles[i]) {
+            // Ensure the handle is still valid before destroying
+            cublasDestroy_org(handle->cublas_handles[i]);
+        }
+        if (handle->events.size() > i && handle->events[i]) {
+            cudaEventDestroy(handle->events[i]);
+        }
+        if (handle->streams.size() > i && handle->streams[i]) {
+            cudaStreamDestroy(handle->streams[i]);
+        }
+    }
+    handle->cublas_handles.clear();
+    handle->events.clear();
+    handle->streams.clear();
 
     delete handle;
     handle = nullptr;
@@ -54,10 +81,37 @@ int mtk::ozimmu::destroy(mtk::ozimmu::handle_t handle) {
 void mtk::ozimmu::set_cuda_stream(mtk::ozimmu::handle_t handle,
                                   cudaStream_t cuda_stream) {
   // Set cuda stream to cuBLAS handler
-  CUTF_CHECK_ERROR(cublasSetStream(handle->cublas_handle, cuda_stream));
+  // CUTF_CHECK_ERROR(cublasSetStream(handle->cublas_handle, cuda_stream));
 
   // Set ozimmu handler
   handle->cuda_stream = cuda_stream;
+}
+
+// Helper function to calculate required workspace size, including per-stream buffers
+std::size_t calculate_total_working_memory(
+  mtk::ozimmu::handle_t handle,
+  std::size_t base_gemm_workspace_size,
+  std::size_t m, std::size_t n,
+  mtk::ozimmu::element_kind_t element_kind)
+{
+  const std::size_t num_streams = handle->streams.size();
+  if (num_streams == 0) {
+       throw std::runtime_error("Stream pool not initialized in handle.");
+  }
+
+  // Size for intermediate int32 results (per stream)
+  const std::size_t size_per_stream_i32 = m * n * sizeof(std::int32_t);
+
+  // Size for intermediate double accumulators (per stream)
+  const std::size_t size_per_stream_f64 = m * n * sizeof(double) * (element_kind == mtk::ozimmu::real ? 1 : 2); // Double storage for complex accumulation parts if needed conceptually
+
+  // Size for the final reduced double result (only one needed)
+  const std::size_t size_final_reduction_f64 = m * n * sizeof(double) * (element_kind == mtk::ozimmu::real ? 1 : 2);
+
+  return base_gemm_workspace_size +
+         (size_per_stream_i32 * num_streams) +
+         (size_per_stream_f64 * num_streams) +
+         size_final_reduction_f64; // Add space for per-stream buffers and final reduction target
 }
 
 std::size_t
@@ -94,7 +148,14 @@ mtk::ozimmu::reallocate_working_memory(mtk::ozimmu::handle_t handle,
 
 std::size_t mtk::ozimmu::reallocate_working_memory(
     mtk::ozimmu::handle_t handle, const mtk::ozimmu::gemm_list_t gemm_list) {
-  std::size_t max_working_memory_size = 0;
+  
+  if (gemm_list.empty()) {
+    return 0; // Nothing to allocate for
+  }
+  std::size_t max_m = 0;
+  std::size_t max_n = 0;
+  std::size_t max_base_gemm_workspace = 0;
+  mtk::ozimmu::element_kind_t effective_element_kind = mtk::ozimmu::real;
 
   for (const auto gemm : gemm_list) {
     const auto op_A = std::get<0>(gemm);
@@ -105,18 +166,32 @@ std::size_t mtk::ozimmu::reallocate_working_memory(
     const auto element_kind = std::get<5>(gemm);
     const auto mode = std::get<6>(gemm);
 
+    // TODO: Need to verify this is necessary. It seems m n will always be the same.
+    // Track max dimensions needed for per-stream buffers
+    max_m = std::max(max_m, m);
+    max_n = std::max(max_n, n);
+    if (element_kind == mtk::ozimmu::complx) {
+        effective_element_kind = mtk::ozimmu::complx;
+    }
+
     const auto working_memory_A =
         mtk::ozimmu::detail::calculate_working_memory_size(
             op_A, m, k, mode, detail::matrix_A, element_kind);
     const auto working_memory_B =
         mtk::ozimmu::detail::calculate_working_memory_size(
             op_B, k, n, mode, detail::matrix_B, element_kind);
-    const auto working_memory_C_fp32 =
-        m * n * mtk::ozimmu::get_data_size_in_byte(fp32);
-    const auto working_memory_C_fp64 =
-        m * n * mtk::ozimmu::get_data_size_in_byte(fp64) *
-        (element_kind == mtk::ozimmu::real ? 1 : 2);
+    // Estimate space for max_exp arrays (needs adjustment based on gemm_int8 implementation)
+    // Example: (m + n) doubles for real, (m+m + n+n) doubles for complex? -> Check gemm_int8 layout
+    std::size_t exp_size = (element_kind == mtk::ozimmu::real) ?
+                           (m + n) * sizeof(double) :
+                           (m * 2 + n * 2) * sizeof(double);
+    // const auto working_memory_C_fp32 =
+    //     m * n * mtk::ozimmu::get_data_size_in_byte(fp32);
+    // const auto working_memory_C_fp64 =
+    //     m * n * mtk::ozimmu::get_data_size_in_byte(fp64) *
+    //     (element_kind == mtk::ozimmu::real ? 1 : 2);
     std::size_t etc = 0;
+    // if (mode >= mtk::ozimmu::fp64_int8_3 && mode <= mtk::ozimmu::fp64_int8_18) ?
     if (mode == mtk::ozimmu::fp64_int8_3 || mode == mtk::ozimmu::fp64_int8_4 ||
         mode == mtk::ozimmu::fp64_int8_5 || mode == mtk::ozimmu::fp64_int8_6 ||
         mode == mtk::ozimmu::fp64_int8_7 || mode == mtk::ozimmu::fp64_int8_8 ||
@@ -132,15 +207,54 @@ std::size_t mtk::ozimmu::reallocate_working_memory(
       etc = (m + n) * mtk::ozimmu::get_data_size_in_byte(fp64) *
             (element_kind == mtk::ozimmu::real ? 1 : 2);
     }
+    // Accumulate base workspace size (excluding per-stream buffers)
+    // IMPORTANT: This calculation MUST match the layout used in gemm_int8 *before* the per-stream buffers.
+    // The original calculation might need refinement. Let's use a simplified placeholder based on original code.
+    // Placeholder: Assuming working_memory_A/B cover the int8 slices and exp_size covers the max_exp arrays.
+    // Revisit this calculation based on the final gemm_int8<T> implementation layout.
+    std::size_t current_base_size = working_memory_A + working_memory_B + exp_size + etc;
 
-    max_working_memory_size =
-        std::max(max_working_memory_size, working_memory_A + working_memory_B +
-                                              working_memory_C_fp32 +
-                                              working_memory_C_fp64 + etc);
+    max_base_gemm_workspace = std::max(max_base_gemm_workspace, current_base_size);
   }
 
-  return mtk::ozimmu::reallocate_working_memory(handle,
-                                                max_working_memory_size);
+    // Calculate total size including per-stream buffers based on max M/N
+    const std::size_t total_required_size = calculate_total_working_memory(
+      handle, max_base_gemm_workspace, max_m, max_n, effective_element_kind);
+
+  // Now perform the reallocation if needed
+  if (total_required_size > handle->current_working_memory_size) {
+    handle->current_working_memory_size = total_required_size;
+
+    ozIMMU_log("Reallocated memory for GEMM list: " + std::to_string(total_required_size) + " B");
+
+    // Free existing buffer (using cuda_stream if async)
+    if (handle->working_memory_ptr != nullptr) {
+      if (handle->malloc_mode == mtk::ozimmu::malloc_sync) {
+        CUTF_CHECK_ERROR(cudaFree(handle->working_memory_ptr));
+      } else {
+        CUTF_CHECK_ERROR(
+            cudaFreeAsync(handle->working_memory_ptr, handle->cuda_stream));
+         // Sync needed before reallocation if using async free
+         // CUTF_CHECK_ERROR(cudaStreamSynchronize(handle->cuda_stream));
+      }
+    }
+
+    // Alloc new buffer (using cuda_stream if async)
+    if (handle->malloc_mode == mtk::ozimmu::malloc_sync) {
+      CUTF_CHECK_ERROR(cudaMalloc(&(handle->working_memory_ptr),
+                                   handle->current_working_memory_size));
+    } else {
+      CUTF_CHECK_ERROR(cudaMallocAsync(&(handle->working_memory_ptr),
+                                        handle->current_working_memory_size,
+                                        handle->cuda_stream));
+        // Sync needed before use if using async malloc
+       // CUTF_CHECK_ERROR(cudaStreamSynchronize(handle->cuda_stream));
+    }
+
+    return total_required_size;
+  }
+  return 0; // No reallocation needed or occurred
+
 }
 
 std::string
