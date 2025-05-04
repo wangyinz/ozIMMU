@@ -5,7 +5,8 @@
 #include <stdexcept>
 
 // Define the size of the stream/handle pool
-#define OZIMMU_STREAM_POOL_SIZE 8
+#define OZIMMU_STREAM_POOL_SIZE 12
+#define OZIMMU_SM_COUNT 33
 
 int mtk::ozimmu::create(mtk::ozimmu::handle_t *h,
                         mtk::ozimmu::malloc_mode_t mm) {
@@ -26,6 +27,7 @@ int mtk::ozimmu::create(mtk::ozimmu::handle_t *h,
     CUTF_CHECK_ERROR(cublasCreate_org(&handle->cublas_handles[i]));
     // Associate each cuBLAS handle with its stream
     CUTF_CHECK_ERROR(cublasSetStream(handle->cublas_handles[i], handle->streams[i]));
+    cublasSetSmCountTarget(handle->cublas_handles[i], OZIMMU_SM_COUNT);
   }
 
   handle->current_working_memory_size = 0;
