@@ -40,10 +40,44 @@ struct mtk::ozimmu::handle {
   std::uint32_t intercept_threshold_k;
 };
 
+
+struct mtk::ozimmu::WorkspaceLayoutOffsets {
+  // Base workspace offsets (example, adjust based on gemm_int8<T>)
+  std::size_t a_max_exp_offset;
+  std::size_t b_max_exp_offset;
+  std::size_t a_int8_slices_offset;
+  std::size_t b_int8_slices_offset;
+  // ... add other base offsets (e.g., complex parts)
+
+  std::size_t base_workspace_end_offset;
+
+  // +++ ADDED +++ Offset for the embedded pointer array
+  std::size_t pointer_array_offset; // Offset from workspace_base
+  // -------------
+
+  // Per-stream offsets (now relative to workspace_base OR could be kept relative to a later point)
+  // Let's keep them relative to workspace_base for simplicity here.
+  std::size_t per_stream_i32_start_offset;
+  std::size_t per_stream_f64_start_offset;
+
+  // Final reduction buffer offset (relative to workspace_base)
+  std::size_t final_f64_reduction_offset;
+
+  // +++ ADDED +++ Total size, useful for checks
+  std::size_t total_calculated_size;
+};
+
 namespace mtk {
 namespace ozimmu {
 cublasStatus_t cublasCreate_org(cublasHandle_t *handle_ptr);
 
 cublasStatus_t cublasDestroy_org(cublasHandle_t handle_ptr);
+
+mtk::ozimmu::WorkspaceLayoutOffsets calculate_workspace_layout(
+  std::size_t m, std::size_t n, std::size_t k,
+  unsigned num_split,
+  mtk::ozimmu::element_kind_t element_kind,
+  std::size_t num_streams
+);
 } // namespace ozimmu
 } // namespace mtk

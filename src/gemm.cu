@@ -548,12 +548,16 @@ int gemm_int8<double>(mtk::ozimmu::handle_t handle,
                       double *const c_ptr, std::size_t ldc,
                       const mtk::ozimmu::compute_mode_t compute_mode) {
   const std::size_t num_streams = handle->streams.size();
-  
+
+  const auto split_config_obj = mtk::ozimmu::detail::get_split_config(compute_mode);
   const std::int8_t num_split = mtk::ozimmu::detail::get_split_config(compute_mode)
                                   .matrix_A_split_types.size() -
                               1;
   const std::int8_t bits_per_int8 = mtk::ozimmu::get_bits_per_int8(k);
 
+  const mtk::ozimmu::WorkspaceLayoutOffsets layout = calculate_workspace_layout(
+    m, n, k, num_split, mtk::ozimmu::real, num_streams
+  );
 
   // Part 1: Base workspace (split A/B, max_exp arrays)
   // IMPORTANT: Recalculate the exact size needed here, matching reallocate_working_memory's base calculation.
@@ -562,44 +566,38 @@ int gemm_int8<double>(mtk::ozimmu::handle_t handle,
   const auto num_int8_a_slice_elements = mtk::ozimmu::get_slice_num_elements<std::int8_t>(m, k, mtk::ozimmu::op_t);
   const auto num_int8_b_slice_elements = mtk::ozimmu::get_slice_num_elements<std::int8_t>(k, n, mtk::ozimmu::op_n);
 
-  // Base Workspace Pointers (Order and size must be precise) - **VERIFY THESE**
-  std::size_t current_offset = 0;
+  // Base Workspace Pointers (Order and size must be precise)
   std::uint8_t *workspace_base = reinterpret_cast<std::uint8_t*>(handle->working_memory_ptr);
 
-  // Example layout (adjust based on actual needs):
-  double* a_max_exp_ptr = reinterpret_cast<double*>(workspace_base + current_offset);
-  current_offset += m * sizeof(double);
-  double* b_max_exp_ptr = reinterpret_cast<double*>(workspace_base + current_offset);
-  current_offset += n * sizeof(double);
-  std::int8_t* a_int8_slices_ptr = reinterpret_cast<std::int8_t*>(workspace_base + current_offset);
-  std::size_t size_split_A = num_int8_a_slice_elements * num_split * sizeof(std::int8_t); // Simplified size
-  current_offset += size_split_A;
-  std::int8_t* b_int8_slices_ptr = reinterpret_cast<std::int8_t*>(workspace_base + current_offset);
-  std::size_t size_split_B = num_int8_b_slice_elements * num_split * sizeof(std::int8_t); // Simplified size
-  current_offset += size_split_B;
-  // Add other base buffers if needed...
-  const std::size_t base_workspace_end_offset = current_offset;
+  // Base Workspace Pointers
+  double* a_max_exp_ptr = reinterpret_cast<double*>(workspace_base + layout.a_max_exp_offset);
+  double* b_max_exp_ptr = reinterpret_cast<double*>(workspace_base + layout.b_max_exp_offset);
+  std::int8_t* a_int8_slices_ptr = reinterpret_cast<std::int8_t*>(workspace_base + layout.a_int8_slices_offset);
+  std::int8_t* b_int8_slices_ptr = reinterpret_cast<std::int8_t*>(workspace_base + layout.b_int8_slices_offset);
+
+  // +++ Calculate pointer TO the embedded pointer array +++
+  double** d_per_stream_f64_pointers_array_in_workspace = reinterpret_cast<double**>(
+      workspace_base + layout.pointer_array_offset
+  );
   
   // Part 2: Per-stream workspace
   const std::size_t size_per_stream_i32 = m * n * sizeof(std::int32_t);
   const std::size_t size_per_stream_f64 = m * n * sizeof(double);
-  const std::size_t size_final_reduction_f64 = size_per_stream_f64; // Re-use size calculation
-
   std::vector<std::int32_t*> d_per_stream_c_i32_ptrs(num_streams);
   std::vector<double*> d_per_stream_c_f64_ptrs(num_streams);
-  std::uint8_t* per_stream_base_ptr = workspace_base + base_workspace_end_offset;
-  current_offset = 0; // Reset offset relative to per_stream_base_ptr
-  
+
   for (std::size_t i = 0; i < num_streams; ++i) {
-    d_per_stream_c_i32_ptrs[i] = reinterpret_cast<std::int32_t*>(per_stream_base_ptr + current_offset);
-    current_offset += size_per_stream_i32;
+        d_per_stream_c_i32_ptrs[i] = reinterpret_cast<std::int32_t*>(
+            workspace_base + layout.per_stream_i32_start_offset + (i * size_per_stream_i32)
+        );
+        d_per_stream_c_f64_ptrs[i] = reinterpret_cast<double*>(
+            workspace_base + layout.per_stream_f64_start_offset + (i * size_per_stream_f64)
+        );
   }
-  double* all_f64_buffers_start = reinterpret_cast<double*>(per_stream_base_ptr + current_offset);
-  for (std::size_t i = 0; i < num_streams; ++i) {
-      d_per_stream_c_f64_ptrs[i] = reinterpret_cast<double*>(per_stream_base_ptr + current_offset);
-      current_offset += size_per_stream_f64;
-  }
-  double* d_final_reduced_f64_ptr = reinterpret_cast<double*>(per_stream_base_ptr + current_offset);
+  // Final reduction buffer pointer
+  double* d_final_reduced_f64_ptr = reinterpret_cast<double*>(
+    workspace_base + layout.final_f64_reduction_offset
+  );
   // --- End Workspace Layout ---
 
   // --- Setup Phase (on cuda_stream) ---
@@ -623,24 +621,16 @@ int gemm_int8<double>(mtk::ozimmu::handle_t handle,
   // Record event when split is done on its stream
   CUTF_CHECK_ERROR(cudaEventRecord(split_done_event, handle->cuda_stream));
 
-  // Launch single kernel to initialize ALL per-stream f64 buffers
-  init_accumulator_buffer<double>(
-    all_f64_buffers_start,          // Start of the entire f64 region
-    m * n * num_streams,            // Total number of elements
-    handle->cuda_stream             // Launch on cuda_stream
+  // Initialize ALL per-stream f64 buffers using the STARTING pointer
+  if (!d_per_stream_c_f64_ptrs.empty()) {
+    init_accumulator_buffer<double>(
+        d_per_stream_c_f64_ptrs[0], // Pointer to the very first f64 buffer
+        m * n * num_streams,        // Total elements in all f64 buffers
+        handle->cuda_stream
     );
-  // Record event when init is done on its stream
+  }
   CUTF_CHECK_ERROR(cudaEventRecord(init_done_event, handle->cuda_stream));
-
-  // Create device array of pointers for reduction kernel
-  double** h_per_stream_f64_ptrs = new double*[num_streams];
-  for(size_t i=0; i<num_streams; ++i) h_per_stream_f64_ptrs[i] = d_per_stream_c_f64_ptrs[i];
-  double** d_per_stream_f64_ptrs_array = nullptr;
-  CUTF_CHECK_ERROR(cudaMallocAsync(&d_per_stream_f64_ptrs_array, num_streams * sizeof(double*), handle->cuda_stream));
-  CUTF_CHECK_ERROR(cudaMemcpyAsync(d_per_stream_f64_ptrs_array, h_per_stream_f64_ptrs, num_streams * sizeof(double*), cudaMemcpyHostToDevice, handle->cuda_stream));
-  delete[] h_per_stream_f64_ptrs;
-  // No sync needed here, work below will wait for cuda_stream via events.
-
+ 
   const auto &gemm_pair_config_list =
       mtk::ozimmu::detail::get_split_config(compute_mode).gemm_pair_config_list;
 
@@ -652,7 +642,7 @@ int gemm_int8<double>(mtk::ozimmu::handle_t handle,
     cudaEvent_t current_event = handle->events[stream_idx]; // Use the pre-allocated events
 
     // Make current stream wait for setup phase
-    if (i == stream_idx) {
+    if (i < num_streams) {
       CUTF_CHECK_ERROR(cudaStreamWaitEvent(current_stream, split_done_event, 0));
       CUTF_CHECK_ERROR(cudaStreamWaitEvent(current_stream, init_done_event, 0));
     }
@@ -700,7 +690,7 @@ int gemm_int8<double>(mtk::ozimmu::handle_t handle,
 
   // Reduce results from all per-stream double buffers
   reduce_sum_buffers<double>(
-      d_per_stream_f64_ptrs_array, // Device array of pointers
+      d_per_stream_f64_pointers_array_in_workspace, // Device array of pointers
       d_final_reduced_f64_ptr,     // Output buffer
       num_streams,                 // Number of buffers to reduce
       m * n,                       // Elements per buffer
@@ -716,8 +706,6 @@ int gemm_int8<double>(mtk::ozimmu::handle_t handle,
       handle->cuda_stream);    // Run on the user stream
 
   // --- Cleanup ---
-  // Free the device array of pointers
-  CUTF_CHECK_ERROR(cudaFreeAsync(d_per_stream_f64_ptrs_array, handle->cuda_stream));
   // Destroy temporary events
   CUTF_CHECK_ERROR(cudaEventDestroy(split_done_event));
   CUTF_CHECK_ERROR(cudaEventDestroy(init_done_event));
