@@ -644,15 +644,18 @@ int gemm_int8<double>(mtk::ozimmu::handle_t handle,
   const auto &gemm_pair_config_list =
       mtk::ozimmu::detail::get_split_config(compute_mode).gemm_pair_config_list;
 
-  for (size_t i = 0; i < gemm_pair_config_list.size(); ++i) {
+  std::size_t gemm_pair_config_list_N = gemm_pair_config_list.size();
+  for (size_t i = 0; i < gemm_pair_config_list_N; ++i) {
     const auto& gemm_pair_config = gemm_pair_config_list[i];
     const std::size_t stream_idx = i % num_streams;
     cudaStream_t current_stream = handle->streams[stream_idx];
     cudaEvent_t current_event = handle->events[stream_idx]; // Use the pre-allocated events
 
     // Make current stream wait for setup phase
-    CUTF_CHECK_ERROR(cudaStreamWaitEvent(current_stream, split_done_event, 0));
-    CUTF_CHECK_ERROR(cudaStreamWaitEvent(current_stream, init_done_event, 0));
+    if (i == stream_idx) {
+      CUTF_CHECK_ERROR(cudaStreamWaitEvent(current_stream, split_done_event, 0));
+      CUTF_CHECK_ERROR(cudaStreamWaitEvent(current_stream, init_done_event, 0));
+    }
 
     std::int32_t* current_c_i32_ptr = d_per_stream_c_i32_ptrs[stream_idx];
     double* current_c_f64_ptr = d_per_stream_c_f64_ptrs[stream_idx];
@@ -683,24 +686,16 @@ int gemm_int8<double>(mtk::ozimmu::handle_t handle,
         current_stream);   // Run on the current stream
 
     // Record event when this stream's work for this iteration is done
-    CUTF_CHECK_ERROR(cudaEventRecord(current_event, current_stream));
+    if (i + num_streams >= gemm_pair_config_list_N) {
+      CUTF_CHECK_ERROR(cudaEventRecord(current_event, current_stream));
+    }
   }
 
   // --- Synchronization and Final Reduction/Copy (on cuda_stream) ---
-
-  // Make the primary user stream wait for ALL iterations to complete across all worker streams
-  for (size_t i = 0; i < gemm_pair_config_list.size(); ++i) {
-      const std::size_t stream_idx = i % num_streams;
-      // Wait for the event corresponding to the last task launched on that stream for this loop
-        CUTF_CHECK_ERROR(cudaStreamWaitEvent(handle->cuda_stream, handle->events[stream_idx], 0));
-        // Optimization: Only need to wait for the *last* event recorded for each stream index
-        // that was actually used in the loop. This simpler version waits for all potentially
-        // recorded events which is safe but might wait slightly longer if list size < num_streams.
-  }
   // Alternative, potentially cleaner wait:
-  // for (std::size_t i = 0; i < std::min(num_streams, gemm_pair_config_list.size()); ++i) {
-  //    CUTF_CHECK_ERROR(cudaStreamWaitEvent(handle->cuda_stream, handle->events[i], 0));
-  //}
+  for (size_t i = 0; i < std::min(num_streams, gemm_pair_config_list.size()); ++i) {
+     CUTF_CHECK_ERROR(cudaStreamWaitEvent(handle->cuda_stream, handle->events[i], 0));
+  }
 
 
   // Reduce results from all per-stream double buffers
