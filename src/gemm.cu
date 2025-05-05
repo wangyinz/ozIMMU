@@ -662,7 +662,7 @@ int gemm_int8<double>(mtk::ozimmu::handle_t handle,
 
     // Call matmul_core (passes k, uses beta_i = 0)
     matmul_core(handle, /* stream_idx if multi-handle, */ handle->cublas_handles[stream_idx], current_stream,
-                op_A, op_B, m, n, k, // Pass original k
+                op_A, op_B, m, n, ld_int8_a, // Pass original k
                 a_ptr, lda, mtk::ozimmu::fp64, b_ptr, ldb, mtk::ozimmu::fp64,
                 0, // beta_i = 0 for int32 output buffer
                 current_c_i32_ptr, // Output: Per-stream int32 buffer
