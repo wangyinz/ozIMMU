@@ -121,7 +121,11 @@ CUBLASAPI cublasStatus_t CUBLASWINAPI cublasDestroy_v2(cublasHandle_t handle) {
   if (global_ozimmu_handle != nullptr) {
     const char* enable_profiling_env = getenv("OZIMMU_ENABLE_PROFILING");
     if (enable_profiling_env != nullptr && std::string(enable_profiling_env) != "0") {
-      mtk::ozimmu::print_profiler_result(*global_ozimmu_handle, "ozIMMU_profiling");
+      const char *csv = getenv("OZIMMU_CSV_OUTPUT");
+      if (csv == nullptr || std::string(csv) == "0")
+        mtk::ozimmu::print_profiler_result(*global_ozimmu_handle, "ozIMMU_profiling");
+      else
+        mtk::ozimmu::print_profiler_result(*global_ozimmu_handle, "ozIMMU_profiling", true);
     }
     ozIMMU_log("Destroying ozIMMU handle...");
     mtk::ozimmu::destroy(get_global_ozimmu_handle());
