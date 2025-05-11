@@ -17,7 +17,11 @@ int mtk::ozimmu::create(mtk::ozimmu::handle_t *h,
 
   // Disable profiling by default
   mtk::ozimmu::disable_profiling(*h);
-
+  const char* enable_profiling_env = getenv("OZIMMU_ENABLE_PROFILING");  
+  if (enable_profiling_env != nullptr && std::string(enable_profiling_env) != "0") {  
+    mtk::ozimmu::enable_profiling(*h);  
+    ozIMMU_log("Profiling Enabled");
+  }
   CUTF_CHECK_ERROR(cudaMalloc(&(handle->d_mantissa_loss_counter_ptr),
                               sizeof(unsigned long long int) *
                                   handle->mantissa_loss_counter_length));

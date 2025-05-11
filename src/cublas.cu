@@ -119,6 +119,10 @@ CUBLASAPI cublasStatus_t CUBLASWINAPI cublasDestroy_v2(cublasHandle_t handle) {
   return CUBLAS_STATUS_NOT_SUPPORTED;
 #else
   if (global_ozimmu_handle != nullptr) {
+    const char* enable_profiling_env = getenv("OZIMMU_ENABLE_PROFILING");
+    if (enable_profiling_env != nullptr && std::string(enable_profiling_env) != "0") {
+      mtk::ozimmu::print_profiler_result(*global_ozimmu_handle, "ozIMMU_profiling");
+    }
     ozIMMU_log("Destroying ozIMMU handle...");
     mtk::ozimmu::destroy(get_global_ozimmu_handle());
     delete global_ozimmu_handle;
